@@ -1,0 +1,823 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PM CopyTrader</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns@3.0.0/dist/chartjs-adapter-date-fns.bundle.min.js"></script>
+<style>
+:root {
+  --bg: #0a0a0f; --card: #12121a; --card2: #181824; --border: #1e1e2e;
+  --text: #e0e0e0; --dim: #666; --green: #00d4aa; --red: #ff4757;
+  --blue: #4facfe; --purple: #a855f7; --gold: #f59e0b; --cyan: #06b6d4;
+}
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { background: var(--bg); color: var(--text); font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; font-size: 14px; }
+
+.header {
+  display: flex; justify-content: space-between; align-items: center;
+  padding: 14px 24px; border-bottom: 1px solid var(--border); background: var(--card);
+}
+.header h1 { font-size: 17px; font-weight: 600; display: flex; align-items: center; gap: 8px; cursor: pointer; }
+.header h1 .badge { font-size: 10px; background: var(--purple); color: white; padding: 2px 8px; border-radius: 10px; font-weight: 500; }
+.poll-ctrl { display: flex; align-items: center; gap: 10px; }
+.poll-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--red); display: inline-block; }
+.poll-dot.on { background: var(--green); animation: pulse 2s infinite; }
+@keyframes pulse { 0%,100%{opacity:1}50%{opacity:.3} }
+.btn { padding: 6px 14px; border: none; border-radius: 6px; cursor: pointer; font-size: 12px; font-weight: 600; transition: opacity .15s; }
+.btn:hover { opacity: .85; }
+.btn-sm { padding: 4px 10px; font-size: 11px; }
+.btn-green { background: var(--green); color: #000; }
+.btn-red { background: var(--red); color: white; }
+.btn-ghost { background: transparent; border: 1px solid var(--border); color: var(--dim); }
+
+.container { max-width: 1400px; margin: 0 auto; padding: 20px; }
+
+.top-stats { display: grid; grid-template-columns: repeat(5, 1fr); gap: 12px; margin-bottom: 20px; }
+.stat-card { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 16px; }
+.stat-card .val { font-size: 22px; font-weight: 700; line-height: 1.2; }
+.stat-card .lbl { font-size: 11px; color: var(--dim); text-transform: uppercase; margin-top: 2px; letter-spacing: .5px; }
+.pos { color: var(--green); }
+.neg { color: var(--red); }
+
+.charts-row { display: grid; grid-template-columns: 2fr 1fr; gap: 16px; margin-bottom: 20px; }
+.chart-card { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 16px; }
+.chart-card h3 { font-size: 13px; margin-bottom: 12px; color: var(--dim); font-weight: 500; }
+.chart-wrap { position: relative; height: 260px; }
+
+.portfolios { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 12px; margin-bottom: 20px; }
+.pf-card { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 16px; cursor: pointer; transition: border-color .15s, transform .1s; }
+.pf-card:hover { border-color: var(--purple); transform: translateY(-2px); }
+.pf-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
+.pf-name { font-weight: 700; font-size: 15px; }
+.pf-pnl { font-size: 20px; font-weight: 700; }
+.pf-stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+.pf-stat { text-align: center; }
+.pf-stat .v { font-size: 16px; font-weight: 600; }
+.pf-stat .l { font-size: 10px; color: var(--dim); text-transform: uppercase; }
+.pf-chart { height: 100px; margin-top: 12px; }
+.pf-sub { font-size: 11px; color: var(--dim); margin-top: 4px; }
+
+.trades-section { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 16px; }
+.trades-section .section-head { font-size: 13px; margin-bottom: 12px; color: var(--dim); font-weight: 500; display: flex; justify-content: space-between; align-items: center; }
+table { width: 100%; border-collapse: collapse; }
+th { text-align: left; font-size: 11px; text-transform: uppercase; color: var(--dim); padding: 6px 8px; border-bottom: 1px solid var(--border); font-weight: 500; }
+td { padding: 7px 8px; border-bottom: 1px solid rgba(255,255,255,.03); font-size: 13px; }
+tr:hover { background: rgba(255,255,255,.02); }
+.side-buy { color: var(--green); font-weight: 600; }
+.side-sell { color: var(--red); font-weight: 600; }
+.tag { display: inline-block; padding: 1px 6px; border-radius: 4px; font-size: 10px; font-weight: 600; cursor: pointer; }
+.tag:hover { opacity: .8; }
+.tag-1 { background: rgba(168,85,247,.15); color: var(--purple); }
+.tag-2 { background: rgba(6,182,212,.15); color: var(--cyan); }
+.tag-3 { background: rgba(245,158,11,.15); color: var(--gold); }
+.tag-4 { background: rgba(239,68,68,.15); color: #ef4444; }
+.tag-5 { background: rgba(34,197,94,.15); color: #22c55e; }
+.tag-6 { background: rgba(249,115,22,.15); color: #f97316; }
+.tag-7 { background: rgba(236,72,153,.15); color: #ec4899; }
+.tag-8 { background: rgba(20,184,166,.15); color: #14b8a6; }
+.tag-9 { background: rgba(139,92,246,.15); color: #8b5cf6; }
+.tag-10 { background: rgba(234,179,8,.15); color: #eab308; }
+
+.empty { text-align: center; padding: 40px; color: var(--dim); }
+.empty-big { font-size: 28px; margin-bottom: 8px; }
+
+/* Detail view */
+.detail-view { display: none; }
+.detail-view.active { display: block; }
+.overview-view.hidden { display: none; }
+.back-btn { display: inline-flex; align-items: center; gap: 6px; color: var(--dim); font-size: 13px; cursor: pointer; margin-bottom: 16px; padding: 6px 12px; border-radius: 6px; border: 1px solid var(--border); background: transparent; }
+.back-btn:hover { color: var(--text); border-color: var(--purple); }
+.detail-header { display: flex; align-items: center; gap: 16px; margin-bottom: 20px; }
+.detail-name { font-size: 24px; font-weight: 700; }
+.detail-addr { font-size: 12px; color: var(--dim); font-family: monospace; }
+.detail-link { font-size: 12px; color: var(--purple); text-decoration: none; }
+.detail-link:hover { text-decoration: underline; }
+.detail-stats { display: grid; grid-template-columns: repeat(6, 1fr); gap: 12px; margin-bottom: 20px; }
+
+/* Live positions */
+.positions-section { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 16px; margin-bottom: 16px; }
+.positions-section h3 { font-size: 13px; color: var(--dim); font-weight: 500; margin-bottom: 10px; }
+
+/* Timeline */
+.timeline { margin-top: 12px; }
+.tl-item { display: flex; gap: 12px; padding: 10px 0; border-bottom: 1px solid rgba(255,255,255,.03); cursor: pointer; border-radius: 6px; padding-left: 8px; margin-left: -8px; margin-right: -8px; padding-right: 8px; }
+.tl-item:last-child { border-bottom: none; }
+.tl-item:hover { background: rgba(255,255,255,.03); }
+.tl-time { min-width: 110px; font-size: 12px; color: var(--dim); line-height: 1.6; }
+.tl-time .date { font-size: 11px; }
+.tl-time .time { font-weight: 600; color: var(--text); }
+.tl-dot { width: 10px; height: 10px; border-radius: 50%; margin-top: 5px; flex-shrink: 0; }
+.tl-dot.buy { background: var(--green); }
+.tl-dot.sell { background: var(--red); }
+.tl-content { flex: 1; }
+.tl-title { font-size: 13px; margin-bottom: 2px; }
+.tl-meta { font-size: 12px; color: var(--dim); }
+.tl-pnl { font-weight: 600; }
+.tl-link { font-size: 11px; color: var(--purple); text-decoration: none; margin-left: 6px; }
+.tl-link:hover { text-decoration: underline; }
+
+.tab-bar { display: flex; gap: 0; margin-bottom: 16px; }
+.tab-bar .tab { padding: 8px 16px; cursor: pointer; font-size: 13px; color: var(--dim); border-bottom: 2px solid transparent; background: none; border-left: none; border-right: none; border-top: none; }
+.tab-bar .tab.active { color: var(--text); border-bottom-color: var(--purple); }
+.tab-bar .tab:hover { color: var(--text); }
+
+/* Trade detail panel */
+.trade-panel-bg { display: none; position: fixed; inset: 0; background: rgba(0,0,0,.6); z-index: 100; justify-content: flex-end; }
+.trade-panel-bg.open { display: flex; }
+.trade-panel { width: 480px; max-width: 95vw; height: 100vh; background: var(--card); border-left: 1px solid var(--border); overflow-y: auto; padding: 24px; animation: slideIn .2s ease; }
+@keyframes slideIn { from { transform: translateX(100%); } to { transform: translateX(0); } }
+.tp-close { position: absolute; top: 16px; right: 16px; background: none; border: none; color: var(--dim); font-size: 20px; cursor: pointer; }
+.tp-close:hover { color: var(--text); }
+.tp-header { margin-bottom: 20px; position: relative; }
+.tp-side { display: inline-block; padding: 3px 10px; border-radius: 4px; font-size: 12px; font-weight: 700; margin-bottom: 8px; }
+.tp-side.buy { background: rgba(0,212,170,.15); color: var(--green); }
+.tp-side.sell { background: rgba(255,71,87,.15); color: var(--red); }
+.tp-market { font-size: 18px; font-weight: 700; margin-bottom: 4px; line-height: 1.3; }
+.tp-outcome { font-size: 14px; color: var(--purple); margin-bottom: 12px; }
+.tp-link { display: inline-block; padding: 6px 14px; background: var(--purple); color: white; border-radius: 6px; text-decoration: none; font-size: 12px; font-weight: 600; }
+.tp-link:hover { opacity: .85; }
+.tp-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin: 20px 0; }
+.tp-cell { background: var(--bg); border-radius: 8px; padding: 12px; }
+.tp-cell .v { font-size: 18px; font-weight: 700; }
+.tp-cell .l { font-size: 10px; color: var(--dim); text-transform: uppercase; margin-top: 2px; }
+.tp-section { margin-top: 20px; }
+.tp-section h4 { font-size: 12px; color: var(--dim); text-transform: uppercase; letter-spacing: .5px; margin-bottom: 10px; }
+.tp-row { display: flex; justify-content: space-between; padding: 8px 0; border-bottom: 1px solid rgba(255,255,255,.03); font-size: 13px; }
+.tp-row:last-child { border-bottom: none; }
+.tp-row .label { color: var(--dim); }
+.tp-tl { position: relative; padding-left: 20px; margin-top: 12px; }
+.tp-tl::before { content: ''; position: absolute; left: 5px; top: 0; bottom: 0; width: 2px; background: var(--border); }
+.tp-tl-item { position: relative; margin-bottom: 16px; }
+.tp-tl-item::before { content: ''; position: absolute; left: -20px; top: 5px; width: 10px; height: 10px; border-radius: 50%; border: 2px solid var(--purple); background: var(--bg); }
+.tp-tl-item.active::before { background: var(--purple); }
+.tp-tl-time { font-size: 11px; color: var(--dim); }
+.tp-tl-text { font-size: 13px; margin-top: 2px; }
+
+@media (max-width: 900px) {
+  .top-stats { grid-template-columns: repeat(3, 1fr); }
+  .charts-row { grid-template-columns: 1fr; }
+  .portfolios { grid-template-columns: 1fr; }
+  .detail-stats { grid-template-columns: repeat(3, 1fr); }
+}
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1 onclick="showOverview()">PM CopyTrader <span class="badge">PAPER</span></h1>
+  <div class="poll-ctrl">
+    <span class="poll-dot" id="poll-dot"></span>
+    <span id="poll-label" style="font-size:12px;color:var(--dim);">—</span>
+    <button class="btn btn-sm btn-green" id="btn-poll" onclick="togglePoll()">Start</button>
+  </div>
+</div>
+
+<div class="container">
+  <!-- ═══ OVERVIEW ═══ -->
+  <div id="overview-view" class="overview-view">
+    <div class="top-stats">
+      <div class="stat-card"><div class="val" id="st-pnl">—</div><div class="lbl">Combined P&L</div></div>
+      <div class="stat-card"><div class="val" id="st-roi">—</div><div class="lbl">ROI</div></div>
+      <div class="stat-card"><div class="val" id="st-trades">0</div><div class="lbl">Total Trades</div></div>
+      <div class="stat-card"><div class="val" id="st-open">0</div><div class="lbl">Open Positions</div></div>
+      <div class="stat-card"><div class="val" id="st-winrate">—</div><div class="lbl">Win Rate</div></div>
+    </div>
+
+    <div class="charts-row">
+      <div class="chart-card">
+        <h3>P&L Over Time</h3>
+        <div class="chart-wrap"><canvas id="pnl-chart"></canvas></div>
+      </div>
+      <div class="chart-card">
+        <h3>P&L by Trader</h3>
+        <div class="chart-wrap"><canvas id="breakdown-chart"></canvas></div>
+      </div>
+    </div>
+
+    <div class="portfolios" id="portfolios"></div>
+
+    <div class="trades-section">
+      <div class="section-head">
+        Recent Trades
+        <select id="filter-strat" onchange="loadTrades()" style="background:var(--bg);border:1px solid var(--border);color:var(--text);padding:4px 8px;border-radius:6px;font-size:12px;">
+          <option value="">All traders</option>
+        </select>
+      </div>
+      <table>
+        <thead><tr>
+          <th>Time</th><th>Trader</th><th>Side</th><th>Market</th><th>Outcome</th><th>Price</th><th>Size</th><th>Current</th><th>P&L</th>
+        </tr></thead>
+        <tbody id="trades-body"></tbody>
+      </table>
+      <div id="trades-empty" class="empty">
+        <div class="empty-big">📊</div>
+        Waiting for trades... Polling is active, trades appear when your targets trade.
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══ TRADER DETAIL ═══ -->
+  <div id="detail-view" class="detail-view">
+    <button class="back-btn" onclick="showOverview()">← Back to overview</button>
+
+    <div class="detail-header">
+      <div>
+        <div class="detail-name" id="d-name"></div>
+        <div class="detail-addr" id="d-addr"></div>
+        <a class="detail-link" id="d-link" href="#" target="_blank">View on Polymarket →</a>
+      </div>
+    </div>
+
+    <div class="detail-stats" id="d-stats"></div>
+
+    <div class="charts-row">
+      <div class="chart-card">
+        <h3>P&L Over Time</h3>
+        <div class="chart-wrap"><canvas id="d-pnl-chart"></canvas></div>
+      </div>
+      <div class="chart-card">
+        <h3>Trades Per Day</h3>
+        <div class="chart-wrap"><canvas id="d-activity-chart"></canvas></div>
+      </div>
+    </div>
+
+    <div class="tab-bar">
+      <button class="tab active" onclick="switchDetailTab('timeline', this)">Timeline</button>
+      <button class="tab" onclick="switchDetailTab('table', this)">Table</button>
+      <button class="tab" onclick="switchDetailTab('positions', this)">Live Positions</button>
+    </div>
+
+    <!-- Timeline -->
+    <div id="dtab-timeline">
+      <div class="trades-section">
+        <div class="section-head">Trade Timeline</div>
+        <div class="timeline" id="d-timeline"></div>
+      </div>
+    </div>
+
+    <!-- Table -->
+    <div id="dtab-table" style="display:none;">
+      <div class="trades-section">
+        <div class="section-head">All Paper Trades</div>
+        <table>
+          <thead><tr>
+            <th>Date</th><th>Time</th><th>Side</th><th>Market</th><th>Outcome</th><th>Entry</th><th>Current</th><th>Size</th><th>P&L</th>
+          </tr></thead>
+          <tbody id="d-trades-body"></tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- Live positions -->
+    <div id="dtab-positions" style="display:none;">
+      <div class="positions-section">
+        <h3>Live Polymarket Positions (from their actual account)</h3>
+        <table>
+          <thead><tr>
+            <th>Market</th><th>Outcome</th><th>Size</th><th>Avg Price</th><th>Current</th><th>P&L</th><th>% P&L</th>
+          </tr></thead>
+          <tbody id="d-positions-body"></tbody>
+        </table>
+        <div id="d-positions-empty" class="empty" style="display:none;">No open positions found</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- TRADE DETAIL PANEL -->
+<div class="trade-panel-bg" id="trade-panel-bg" onclick="if(event.target===this)closeTradePanel()">
+  <div class="trade-panel" id="trade-panel"></div>
+</div>
+
+<script>
+const COLORS = { '432614799197': '#a855f7', '0p0jogggg': '#06b6d4', 'RN1': '#f59e0b', 'Dishonest-Bloom': '#ef4444', 'swisstony': '#22c55e', 'Bitcoin Trader': '#f97316', 'bobe2': '#ec4899', 'geniusMC': '#14b8a6', 'gatorr': '#8b5cf6', 'huhaoli': '#eab308' };
+const TAG_CLS = { '432614799197': 'tag-1', '0p0jogggg': 'tag-2', 'RN1': 'tag-3', 'Dishonest-Bloom': 'tag-4', 'swisstony': 'tag-5', 'Bitcoin Trader': 'tag-6', 'bobe2': 'tag-7', 'geniusMC': 'tag-8', 'gatorr': 'tag-9', 'huhaoli': 'tag-10' };
+let pnlChart = null, breakdownChart = null, detailPnlChart = null, detailActivityChart = null;
+let miniCharts = {};
+let allStrategies = [];
+let currentView = 'overview'; // 'overview' | 'detail'
+let currentDetailStrategy = null;
+
+async function api(method, path, body) {
+  const opts = { method, headers: { 'Content-Type': 'application/json' } };
+  if (body) opts.body = JSON.stringify(body);
+  return (await fetch('/api' + path, opts)).json();
+}
+
+// ── Init ──
+async function init() {
+  await checkPoll();
+  await refresh();
+  setInterval(() => { if (currentView === 'overview') refresh(); }, 15000);
+  setInterval(() => { if (currentView === 'detail' && currentDetailStrategy) refreshDetail(); }, 20000);
+}
+
+async function refresh() {
+  await Promise.all([loadStats(), loadTrades(), loadPnlChart()]);
+}
+
+// ── Navigation ──
+function showOverview() {
+  currentView = 'overview';
+  document.getElementById('overview-view').classList.remove('hidden');
+  document.getElementById('detail-view').classList.remove('active');
+  refresh();
+}
+
+function showTraderDetail(strategyId) {
+  const s = allStrategies.find(x => x.strategy_id === strategyId);
+  if (!s) return;
+  currentView = 'detail';
+  currentDetailStrategy = s;
+  document.getElementById('overview-view').classList.add('hidden');
+  document.getElementById('detail-view').classList.add('active');
+
+  const color = COLORS[s.target_name] || '#888';
+  document.getElementById('d-name').textContent = s.target_name;
+  document.getElementById('d-name').style.color = color;
+  document.getElementById('d-addr').textContent = s.target_address;
+  document.getElementById('d-link').href = s.target_url || `https://polymarket.com/@${s.target_name}`;
+
+  refreshDetail();
+}
+
+async function refreshDetail() {
+  const s = currentDetailStrategy;
+  if (!s) return;
+  const color = COLORS[s.target_name] || '#888';
+
+  // Stats
+  const pnlCls = s.total_pnl >= 0 ? 'pos' : 'neg';
+  document.getElementById('d-stats').innerHTML = `
+    <div class="stat-card"><div class="val ${pnlCls}">${s.total_pnl >= 0 ? '+' : ''}€${s.total_pnl.toFixed(2)}</div><div class="lbl">Paper P&L</div></div>
+    <div class="stat-card"><div class="val ${pnlCls}">${s.roi >= 0 ? '+' : ''}${s.roi}%</div><div class="lbl">ROI</div></div>
+    <div class="stat-card"><div class="val">${s.total_trades}</div><div class="lbl">Trades</div></div>
+    <div class="stat-card"><div class="val">${s.open_trades}</div><div class="lbl">Open</div></div>
+    <div class="stat-card"><div class="val">${s.win_rate}%</div><div class="lbl">Win Rate</div></div>
+    <div class="stat-card"><div class="val">€${s.flat_bet}</div><div class="lbl">Per Trade</div></div>
+  `;
+
+  // Load trades
+  const trades = await api('GET', `/trades?strategy_id=${s.strategy_id}&limit=500`);
+
+  // Merge into cache for trade detail panel
+  trades.forEach(t => { if (!allTradesCache.find(x => x.id === t.id)) allTradesCache.push(t); });
+
+  // Timeline
+  const tlEl = document.getElementById('d-timeline');
+  if (trades.length === 0) {
+    tlEl.innerHTML = '<div class="empty"><div class="empty-big">⏳</div>No trades yet for this trader</div>';
+  } else {
+    let lastDate = '';
+    tlEl.innerHTML = trades.map(t => {
+      const d = parseTS(t.timestamp);
+      const dateStr = d.toLocaleDateString('nl-NL', { weekday: 'short', day: 'numeric', month: 'short' });
+      const timeStr = d.toLocaleTimeString('nl-NL', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+      const pnl = t.pnl || 0;
+      const showDate = dateStr !== lastDate;
+      lastDate = dateStr;
+      const pmUrl = t.market_slug ? `https://polymarket.com/event/${t.market_slug}` : '';
+      return `
+        ${showDate ? `<div style="font-size:12px;color:var(--purple);font-weight:600;padding:12px 0 4px;border-top:1px solid var(--border);margin-top:8px;">${dateStr}</div>` : ''}
+        <div class="tl-item" onclick="openTradePanel(${t.id})">
+          <div class="tl-time">
+            <div class="time">${timeStr}</div>
+          </div>
+          <div class="tl-dot ${(t.side||'').toLowerCase()}"></div>
+          <div class="tl-content">
+            <div class="tl-title">
+              <span class="side-${(t.side||'').toLowerCase()}">${t.side}</span>
+              ${esc(t.outcome || '')} — <span style="color:var(--dim)">${esc(t.title || '-')}</span>
+              ${pmUrl ? `<a class="tl-link" href="${pmUrl}" target="_blank" onclick="event.stopPropagation()">↗ Polymarket</a>` : ''}
+            </div>
+            <div class="tl-meta">
+              Entry: $${(t.price||0).toFixed(3)}
+              ${t.current_price ? ` → Now: $${t.current_price.toFixed(3)}` : ''}
+              · €${(t.notional||0).toFixed(2)}
+              ${pnl !== 0 ? ` · <span class="tl-pnl ${pnl >= 0 ? 'pos' : 'neg'}">${pnl > 0 ? '+' : ''}€${pnl.toFixed(2)}</span>` : ''}
+            </div>
+          </div>
+        </div>
+      `;
+    }).join('');
+  }
+
+  // Table
+  document.getElementById('d-trades-body').innerHTML = trades.map(t => {
+    const d = parseTS(t.timestamp);
+    const pnl = t.pnl || 0;
+    const pmUrl = t.market_slug ? `https://polymarket.com/event/${t.market_slug}` : '';
+    return `<tr style="cursor:pointer" onclick="openTradePanel(${t.id})">
+      <td style="color:var(--dim);font-size:11px;">${d.toLocaleDateString('nl-NL', {day:'2-digit',month:'2-digit',year:'2-digit'})}</td>
+      <td style="font-weight:600;font-size:12px;">${d.toLocaleTimeString('nl-NL', {hour:'2-digit',minute:'2-digit',second:'2-digit'})}</td>
+      <td class="side-${(t.side||'').toLowerCase()}">${t.side}</td>
+      <td style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${esc(t.title || '-')}${pmUrl ? ' <a href="'+pmUrl+'" target="_blank" onclick="event.stopPropagation()" style="color:var(--purple);font-size:10px;">↗</a>' : ''}</td>
+      <td>${esc(t.outcome || '-')}</td>
+      <td>$${(t.price||0).toFixed(3)}</td>
+      <td>${t.current_price ? '$' + t.current_price.toFixed(3) : '-'}</td>
+      <td>€${(t.notional||0).toFixed(2)}</td>
+      <td class="${pnl >= 0 ? 'pos' : 'neg'}">${pnl !== 0 ? (pnl > 0 ? '+' : '') + '€' + pnl.toFixed(2) : '-'}</td>
+    </tr>`;
+  }).join('');
+
+  // Detail P&L chart
+  const pnlData = await api('GET', `/pnl-history?strategy_id=${s.strategy_id}&hours=168`);
+  const dCtx = document.getElementById('d-pnl-chart');
+  if (detailPnlChart) detailPnlChart.destroy();
+  detailPnlChart = new Chart(dCtx, {
+    type: 'line',
+    data: {
+      datasets: [{
+        label: 'P&L',
+        data: pnlData.map(p => ({ x: new Date(p.timestamp + 'Z'), y: p.total_pnl })),
+        borderColor: color,
+        borderWidth: 2,
+        fill: { target: 'origin', above: color + '20', below: 'rgba(255,71,87,.15)' },
+        tension: 0.3,
+        pointRadius: 0
+      }]
+    },
+    options: chartOpts('€')
+  });
+
+  // Activity chart (trades per day)
+  const dayCounts = {};
+  trades.forEach(t => {
+    const day = parseTS(t.timestamp).toISOString().slice(0, 10);
+    dayCounts[day] = (dayCounts[day] || 0) + 1;
+  });
+  const days = Object.keys(dayCounts).sort();
+  const aCtx = document.getElementById('d-activity-chart');
+  if (detailActivityChart) detailActivityChart.destroy();
+  detailActivityChart = new Chart(aCtx, {
+    type: 'bar',
+    data: {
+      labels: days,
+      datasets: [{
+        label: 'Trades',
+        data: days.map(d => dayCounts[d]),
+        backgroundColor: color + '80',
+        borderRadius: 3
+      }]
+    },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      plugins: { legend: { display: false } },
+      scales: {
+        x: { ticks: { color: '#444', font: { size: 10 } }, grid: { display: false } },
+        y: { ticks: { color: '#888', stepSize: 1 }, grid: { color: 'rgba(255,255,255,.05)' } }
+      }
+    }
+  });
+
+  // Live positions
+  loadLivePositions(s.target_address);
+}
+
+async function loadLivePositions(address) {
+  try {
+    const positions = await api('GET', '/pm/positions/' + address);
+    const el = document.getElementById('d-positions-body');
+    const empty = document.getElementById('d-positions-empty');
+    if (!Array.isArray(positions) || positions.length === 0) {
+      el.innerHTML = '';
+      empty.style.display = '';
+      return;
+    }
+    empty.style.display = 'none';
+    el.innerHTML = positions.slice(0, 50).map(p => {
+      const pnl = parseFloat(p.cashPnl || 0);
+      const pctPnl = parseFloat(p.percentPnl || 0);
+      return `<tr>
+        <td style="max-width:250px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${esc(p.title || '-')}</td>
+        <td>${esc(p.outcome || '-')}</td>
+        <td>${parseFloat(p.size || 0).toFixed(1)}</td>
+        <td>$${parseFloat(p.avgPrice || 0).toFixed(3)}</td>
+        <td>$${parseFloat(p.curPrice || 0).toFixed(3)}</td>
+        <td class="${pnl >= 0 ? 'pos' : 'neg'}">${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)}</td>
+        <td class="${pctPnl >= 0 ? 'pos' : 'neg'}">${pctPnl >= 0 ? '+' : ''}${(pctPnl * 100).toFixed(1)}%</td>
+      </tr>`;
+    }).join('');
+  } catch(e) {
+    document.getElementById('d-positions-body').innerHTML = '';
+    document.getElementById('d-positions-empty').style.display = '';
+  }
+}
+
+function switchDetailTab(tab, btn) {
+  document.querySelectorAll('.tab-bar .tab').forEach(t => t.classList.remove('active'));
+  btn.classList.add('active');
+  ['timeline', 'table', 'positions'].forEach(t => {
+    document.getElementById('dtab-' + t).style.display = t === tab ? '' : 'none';
+  });
+}
+
+// ── Overview Stats ──
+async function loadStats() {
+  const data = await api('GET', '/stats');
+  const c = data.combined;
+  allStrategies = data.strategies;
+
+  document.getElementById('st-pnl').className = 'val ' + (c.total_pnl >= 0 ? 'pos' : 'neg');
+  document.getElementById('st-pnl').textContent = (c.total_pnl >= 0 ? '+' : '') + '€' + c.total_pnl.toFixed(2);
+  document.getElementById('st-roi').className = 'val ' + (c.roi >= 0 ? 'pos' : 'neg');
+  document.getElementById('st-roi').textContent = (c.roi >= 0 ? '+' : '') + c.roi.toFixed(1) + '%';
+  document.getElementById('st-trades').textContent = c.total_trades;
+  document.getElementById('st-open').textContent = c.open_trades;
+  document.getElementById('st-winrate').textContent = c.total_trades > 0 ? c.win_rate + '%' : '—';
+
+  const filter = document.getElementById('filter-strat');
+  if (filter.options.length <= 1) {
+    data.strategies.forEach(s => {
+      const o = document.createElement('option');
+      o.value = s.strategy_id;
+      o.textContent = s.target_name;
+      filter.appendChild(o);
+    });
+  }
+
+  const el = document.getElementById('portfolios');
+  el.innerHTML = data.strategies.map(s => {
+    const color = COLORS[s.target_name] || '#888';
+    const pnlCls = s.total_pnl >= 0 ? 'pos' : 'neg';
+    return `
+      <div class="pf-card" onclick="showTraderDetail(${s.strategy_id})" style="border-top: 2px solid ${color};">
+        <div class="pf-header">
+          <div>
+            <div class="pf-name" style="color:${color};">${esc(s.target_name)}</div>
+            <div class="pf-sub">€${s.flat_bet}/trade · ${s.total_trades} trades</div>
+          </div>
+          <div class="pf-pnl ${pnlCls}">${s.total_pnl >= 0 ? '+' : ''}€${s.total_pnl.toFixed(2)}</div>
+        </div>
+        <div class="pf-stats" style="grid-template-columns: repeat(4, 1fr);">
+          <div class="pf-stat"><div class="v">${s.total_trades}</div><div class="l">Trades</div></div>
+          <div class="pf-stat"><div class="v">€${s.total_notional.toFixed(0)}</div><div class="l">Invested</div></div>
+          <div class="pf-stat"><div class="v">${s.win_rate}%</div><div class="l">Win Rate</div></div>
+          <div class="pf-stat"><div class="v ${pnlCls}">${s.roi >= 0 ? '+' : ''}${s.roi}%</div><div class="l">ROI</div></div>
+        </div>
+        <div class="pf-chart"><canvas id="mini-${s.strategy_id}"></canvas></div>
+      </div>
+    `;
+  }).join('');
+
+  for (const s of data.strategies) { loadMiniChart(s.strategy_id); }
+}
+
+// ── P&L Chart ──
+async function loadPnlChart() {
+  const [combined, strats] = await Promise.all([
+    api('GET', '/pnl-history?strategy_id=0&hours=168'),
+    api('GET', '/strategies')
+  ]);
+
+  const stratData = {};
+  for (const s of strats) {
+    stratData[s.id] = await api('GET', `/pnl-history?strategy_id=${s.id}&hours=168`);
+  }
+
+  const ctx = document.getElementById('pnl-chart');
+  if (pnlChart) pnlChart.destroy();
+
+  const datasets = [{
+    label: 'Combined',
+    data: combined.map(s => ({ x: new Date(s.timestamp + 'Z'), y: s.total_pnl })),
+    borderColor: '#fff',
+    borderWidth: 2,
+    fill: false,
+    tension: 0.3,
+    pointRadius: 0
+  }];
+
+  for (const s of strats) {
+    const d = stratData[s.id] || [];
+    datasets.push({
+      label: s.target_name || s.name,
+      data: d.map(p => ({ x: new Date(p.timestamp + 'Z'), y: p.total_pnl })),
+      borderColor: COLORS[s.target_name] || '#888',
+      borderWidth: 1.5,
+      fill: false,
+      tension: 0.3,
+      pointRadius: 0,
+      borderDash: [4, 2]
+    });
+  }
+
+  pnlChart = new Chart(ctx, { type: 'line', data: { datasets }, options: chartOpts('€') });
+
+  // Breakdown
+  const bCtx = document.getElementById('breakdown-chart');
+  if (breakdownChart) breakdownChart.destroy();
+  const statsData = await api('GET', '/stats');
+  breakdownChart = new Chart(bCtx, {
+    type: 'bar',
+    data: {
+      labels: statsData.strategies.map(s => s.target_name),
+      datasets: [{
+        label: 'P&L',
+        data: statsData.strategies.map(s => s.total_pnl),
+        backgroundColor: statsData.strategies.map(s => COLORS[s.target_name] || '#888'),
+        borderRadius: 4
+      }]
+    },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      plugins: { legend: { display: false } },
+      scales: {
+        x: { ticks: { color: '#888' }, grid: { display: false } },
+        y: { ticks: { color: '#888', callback: v => '€' + v }, grid: { color: 'rgba(255,255,255,.05)' } }
+      }
+    }
+  });
+}
+
+async function loadMiniChart(stratId) {
+  const data = await api('GET', `/pnl-history?strategy_id=${stratId}&hours=168`);
+  const canvas = document.getElementById('mini-' + stratId);
+  if (!canvas || data.length === 0) return;
+  if (miniCharts[stratId]) miniCharts[stratId].destroy();
+  const color = data[data.length - 1]?.total_pnl >= 0 ? '#00d4aa' : '#ff4757';
+  miniCharts[stratId] = new Chart(canvas, {
+    type: 'line',
+    data: {
+      labels: data.map(d => d.timestamp),
+      datasets: [{ data: data.map(d => d.total_pnl), borderColor: color, borderWidth: 1.5, fill: { target: 'origin', above: color + '15', below: 'rgba(255,71,87,.1)' }, tension: 0.3, pointRadius: 0 }]
+    },
+    options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } }, scales: { x: { display: false }, y: { display: false } } }
+  });
+}
+
+// ── Trades ──
+async function loadTrades() {
+  const stratId = document.getElementById('filter-strat').value;
+  const url = stratId ? `/trades?strategy_id=${stratId}&limit=100` : '/trades?limit=100';
+  const trades = await api('GET', url);
+  const el = document.getElementById('trades-body');
+  const empty = document.getElementById('trades-empty');
+
+  if (trades.length === 0) { el.innerHTML = ''; empty.style.display = ''; return; }
+  empty.style.display = 'none';
+
+  // Merge into cache for trade detail panel
+  trades.forEach(t => { if (!allTradesCache.find(x => x.id === t.id)) allTradesCache.push(t); });
+
+  el.innerHTML = trades.map(t => {
+    const pnl = t.pnl || 0;
+    const tagCls = TAG_CLS[t.target_name] || '';
+    const pmUrl = t.market_slug ? `https://polymarket.com/event/${t.market_slug}` : '';
+    return `<tr style="cursor:pointer" onclick="openTradePanel(${t.id})">
+      <td style="color:var(--dim);font-size:11px;white-space:nowrap;">${fmtDate(t.timestamp)}</td>
+      <td><span class="tag ${tagCls}" onclick="event.stopPropagation();showTraderByName('${esc(t.target_name)}')">${esc(t.target_name)}</span></td>
+      <td class="side-${(t.side||'').toLowerCase()}">${t.side}</td>
+      <td style="max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${esc(t.title || '-')}${pmUrl ? ' <a href="'+pmUrl+'" target="_blank" onclick="event.stopPropagation()" style="color:var(--purple);font-size:10px;">↗</a>' : ''}</td>
+      <td>${esc(t.outcome || '-')}</td>
+      <td>$${(t.price||0).toFixed(3)}</td>
+      <td>€${(t.notional||0).toFixed(2)}</td>
+      <td>${t.current_price ? '$' + t.current_price.toFixed(3) : '-'}</td>
+      <td class="${pnl >= 0 ? 'pos' : 'neg'}">${pnl !== 0 ? (pnl > 0 ? '+' : '') + '€' + pnl.toFixed(2) : '-'}</td>
+    </tr>`;
+  }).join('');
+}
+
+function showTraderByName(name) {
+  const s = allStrategies.find(x => x.target_name === name);
+  if (s) showTraderDetail(s.strategy_id);
+}
+
+// ── Polling ──
+async function checkPoll() {
+  const d = await api('GET', '/polling/status');
+  updatePollUI(d.running);
+}
+async function togglePoll() {
+  const d = await api('GET', '/polling/status');
+  if (d.running) { await api('POST', '/polling/stop'); updatePollUI(false); }
+  else { await api('POST', '/polling/start'); updatePollUI(true); }
+}
+function updatePollUI(on) {
+  document.getElementById('poll-dot').className = 'poll-dot' + (on ? ' on' : '');
+  document.getElementById('poll-label').textContent = on ? 'Polling every 5s' : 'Stopped';
+  document.getElementById('btn-poll').textContent = on ? 'Stop' : 'Start';
+  document.getElementById('btn-poll').className = 'btn btn-sm ' + (on ? 'btn-red' : 'btn-green');
+}
+
+// ── Utils ──
+function esc(s) { const d = document.createElement('div'); d.textContent = s||''; return d.innerHTML; }
+function parseTS(ts) {
+  if (!ts) return new Date();
+  return new Date(ts.includes('T') ? ts : ts + 'Z');
+}
+function fmtDate(ts) {
+  const d = parseTS(ts);
+  return d.toLocaleDateString('nl-NL', {day:'2-digit',month:'2-digit'}) + ' ' + d.toLocaleTimeString('nl-NL', {hour:'2-digit',minute:'2-digit'});
+}
+function chartOpts(prefix) {
+  return {
+    responsive: true, maintainAspectRatio: false,
+    interaction: { mode: 'index', intersect: false },
+    plugins: { legend: { position: 'top', labels: { color: '#888', font: { size: 11 }, boxWidth: 12 } } },
+    scales: {
+      x: { type: 'timeseries', time: { tooltipFormat: 'dd MMM HH:mm' }, ticks: { color: '#444', font: { size: 10 } }, grid: { color: 'rgba(255,255,255,.03)' } },
+      y: { ticks: { color: '#888', callback: v => prefix + v.toFixed(2) }, grid: { color: 'rgba(255,255,255,.05)' } }
+    }
+  };
+}
+
+// ── Trade Detail Panel ──
+let allTradesCache = [];
+
+function openTradePanel(tradeId) {
+  const t = allTradesCache.find(x => x.id === tradeId);
+  if (!t) return;
+
+  const d = parseTS(t.timestamp);
+  const pnl = t.pnl || 0;
+  const pmUrl = t.market_slug ? `https://polymarket.com/event/${t.market_slug}` : '';
+  const color = COLORS[t.target_name] || '#888';
+  const tagCls = TAG_CLS[t.target_name] || '';
+  const priceChange = t.current_price ? ((t.current_price - t.price) / t.price * 100) : 0;
+  const now = new Date();
+  const ageMs = now - d;
+  const ageMin = Math.floor(ageMs / 60000);
+  const ageStr = ageMin < 60 ? `${ageMin}m ago` : ageMin < 1440 ? `${Math.floor(ageMin/60)}h ${ageMin%60}m ago` : `${Math.floor(ageMin/1440)}d ago`;
+
+  document.getElementById('trade-panel').innerHTML = `
+    <button class="tp-close" onclick="closeTradePanel()">&times;</button>
+    <div class="tp-header">
+      <div class="tp-side ${(t.side||'').toLowerCase()}">${t.side}</div>
+      <div class="tp-market">${esc(t.title || 'Unknown Market')}</div>
+      <div class="tp-outcome">${esc(t.outcome || '-')}</div>
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+        ${pmUrl ? `<a class="tp-link" href="${pmUrl}" target="_blank">Open on Polymarket ↗</a>` : ''}
+        <span class="tag ${tagCls}" style="cursor:pointer;" onclick="closeTradePanel();showTraderByName('${esc(t.target_name)}')">${esc(t.target_name)}</span>
+      </div>
+    </div>
+
+    <div class="tp-grid">
+      <div class="tp-cell">
+        <div class="v">$${(t.price||0).toFixed(3)}</div>
+        <div class="l">Entry Price</div>
+      </div>
+      <div class="tp-cell">
+        <div class="v">${t.current_price ? '$' + t.current_price.toFixed(3) : '-'}</div>
+        <div class="l">Current Price</div>
+      </div>
+      <div class="tp-cell">
+        <div class="v ${pnl >= 0 ? 'pos' : 'neg'}">${pnl !== 0 ? (pnl > 0 ? '+' : '') + '€' + pnl.toFixed(2) : '€0.00'}</div>
+        <div class="l">Paper P&L</div>
+      </div>
+      <div class="tp-cell">
+        <div class="v ${priceChange >= 0 ? 'pos' : 'neg'}">${priceChange >= 0 ? '+' : ''}${priceChange.toFixed(1)}%</div>
+        <div class="l">Price Change</div>
+      </div>
+    </div>
+
+    <div class="tp-section">
+      <h4>Trade Details</h4>
+      <div class="tp-row"><span class="label">Size (shares)</span><span>${t.size}</span></div>
+      <div class="tp-row"><span class="label">Notional</span><span>€${(t.notional||0).toFixed(2)}</span></div>
+      <div class="tp-row"><span class="label">Target's size</span><span>${t.target_size ? t.target_size.toFixed(1) + ' shares' : '-'}</span></div>
+      <div class="tp-row"><span class="label">Target's price</span><span>${t.target_price ? '$' + t.target_price.toFixed(3) : '-'}</span></div>
+      <div class="tp-row"><span class="label">Status</span><span style="color:${t.status === 'open' ? 'var(--green)' : 'var(--dim)'}">${t.status || 'open'}</span></div>
+      <div class="tp-row"><span class="label">Condition ID</span><span style="font-family:monospace;font-size:11px;">${t.condition_id ? t.condition_id.slice(0,10) + '...' : '-'}</span></div>
+      ${t.target_tx ? `<div class="tp-row"><span class="label">TX Hash</span><a href="https://polygonscan.com/tx/${t.target_tx}" target="_blank" style="color:var(--purple);font-family:monospace;font-size:11px;">${t.target_tx.slice(0,10)}...↗</a></div>` : ''}
+    </div>
+
+    <div class="tp-section">
+      <h4>Timeline</h4>
+      <div class="tp-tl">
+        <div class="tp-tl-item active">
+          <div class="tp-tl-time">${d.toLocaleDateString('nl-NL', {weekday:'short', day:'numeric', month:'short', year:'numeric'})} · ${d.toLocaleTimeString('nl-NL', {hour:'2-digit', minute:'2-digit', second:'2-digit'})}</div>
+          <div class="tp-tl-text"><strong style="color:${t.side === 'BUY' ? 'var(--green)' : 'var(--red)'}">${t.side}</strong> ${t.size} shares of "${esc(t.outcome || '-')}" @ $${(t.price||0).toFixed(3)}</div>
+        </div>
+        <div class="tp-tl-item active">
+          <div class="tp-tl-time">${d.toLocaleTimeString('nl-NL', {hour:'2-digit', minute:'2-digit', second:'2-digit'})}</div>
+          <div class="tp-tl-text">Paper trade copied · €${(t.notional||0).toFixed(2)} allocated</div>
+        </div>
+        ${t.current_price ? `
+        <div class="tp-tl-item active">
+          <div class="tp-tl-time">Now · ${ageStr}</div>
+          <div class="tp-tl-text">Price moved to $${t.current_price.toFixed(3)} · <span class="${pnl >= 0 ? 'pos' : 'neg'}">${pnl > 0 ? '+' : ''}€${pnl.toFixed(2)}</span></div>
+        </div>` : ''}
+        <div class="tp-tl-item">
+          <div class="tp-tl-time">Pending</div>
+          <div class="tp-tl-text" style="color:var(--dim);">Market resolution</div>
+        </div>
+      </div>
+    </div>
+  `;
+
+  document.getElementById('trade-panel-bg').classList.add('open');
+}
+
+function closeTradePanel() {
+  document.getElementById('trade-panel-bg').classList.remove('open');
+}
+
+document.addEventListener('keydown', e => { if (e.key === 'Escape') closeTradePanel(); });
+
+init();
+</script>
+</body>
+</html>
