@@ -133,10 +133,10 @@ app.get('/api/status', (req, res) => {
 // ── Polygon provider helper ──
 const RPCS = [
   'https://polygon-bor-rpc.publicnode.com',
-  'https://polygon.llamarpc.com',
-  'https://1rpc.io/matic',
-  'https://polygon-rpc.com',
+  'https://polygon.drpc.org',
+  'https://polygon.gateway.tenderly.co',
 ];
+const POLYGON_NETWORK = { name: 'matic', chainId: 137 };
 const USDC_BRIDGED = '0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174'; // USDC.e (Polymarket uses this)
 const USDC_NATIVE  = '0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359'; // Native USDC
 const CTF_EXCHANGE = '0xC5d563A36AE78145C45a50134d48A1215220f80a';
@@ -161,34 +161,57 @@ const NEG_RISK_ADAPTER_ABI = [
 ];
 
 // Custom provider that bypasses proxy for RPC calls
-class DirectRpcProvider extends ethers.providers.JsonRpcProvider {
+class DirectRpcProvider extends ethers.providers.StaticJsonRpcProvider {
   constructor(url) {
-    super(url, 137);
+    super({ url, timeout: 10000 }, POLYGON_NETWORK);
     this._directAgent = new (require('https').Agent)({ keepAlive: true });
+    this._rpcUrl = url;
   }
   async send(method, params) {
     const body = JSON.stringify({ jsonrpc: '2.0', method, params, id: Date.now() });
-    const resp = await globalThis.fetch(this.connection.url, {
+    const resp = await globalThis.fetch(this._rpcUrl, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body,
       agent: this._directAgent, // bypass proxy
+      signal: AbortSignal.timeout(10000),
     });
+    if (!resp.ok) throw new Error(`RPC ${resp.status}`);
     const json = await resp.json();
     if (json.error) throw new Error(json.error.message || JSON.stringify(json.error));
     return json.result;
   }
 }
 
+let providerCache = null;
+let providerCacheTime = 0;
+let preferredRpcIndex = 0;
+const PROVIDER_CACHE_MS = 30000;
+
 async function getProvider() {
-  for (const rpc of RPCS) {
+  if (providerCache && (Date.now() - providerCacheTime) < PROVIDER_CACHE_MS) {
+    return providerCache;
+  }
+
+  let lastError = null;
+  for (let i = 0; i < RPCS.length; i++) {
+    const idx = (preferredRpcIndex + i) % RPCS.length;
+    const rpc = RPCS[idx];
     try {
       const p = new DirectRpcProvider(rpc);
       await p.getBlockNumber();
+      preferredRpcIndex = idx;
+      providerCache = p;
+      providerCacheTime = Date.now();
       return p;
-    } catch(e) { /* try next */ }
+    } catch (e) {
+      lastError = e;
+    }
   }
-  throw new Error('No working Polygon RPC');
+
+  providerCache = null;
+  providerCacheTime = 0;
+  throw new Error(`No working Polygon RPC${lastError ? `: ${lastError.message}` : ''}`);
 }
 
 // Gas override for Polygon (base fee ~100+ gwei currently)
@@ -232,6 +255,8 @@ async function refreshBalance() {
     };
     balanceCacheTime = Date.now();
   } catch(e) {
+    providerCache = null;
+    providerCacheTime = 0;
     console.error('[BALANCE] Refresh error:', e.message);
   }
 }
@@ -498,12 +523,31 @@ app.get('/api/price/:tokenId', async (req, res) => {
   }
 });
 
+async function fetchAllPositions() {
+  const limit = 100;
+  const sizeThreshold = '0.0001';
+  const positions = [];
+
+  for (let offset = 0; ; ) {
+    const url = `https://data-api.polymarket.com/positions?user=${wallet.address}&limit=${limit}&offset=${offset}&sizeThreshold=${sizeThreshold}`;
+    const r = await fetch(url);
+    if (!r.ok) throw new Error(`Positions API ${r.status}`);
+
+    const batch = await r.json();
+    if (!Array.isArray(batch)) throw new Error('Positions API returned non-array payload');
+
+    positions.push(...batch);
+    if (batch.length < limit) break;
+    offset += batch.length;
+  }
+
+  return positions;
+}
+
 app.get('/api/positions', async (req, res) => {
   try {
     if (!clobClient) return res.status(503).json({ error: 'Client not initialized' });
-    const r = await fetch(`https://data-api.polymarket.com/positions?user=${wallet.address}&limit=100&sizeThreshold=0.01`);
-    const positions = await r.json();
-    res.json(positions);
+    res.json(await fetchAllPositions());
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -524,15 +568,19 @@ app.get('/api/orders', async (req, res) => {
 app.post('/api/buy', async (req, res) => {
   try {
     if (!clobClient) return res.status(503).json({ error: 'Client not initialized' });
-    const { tokenId, price, size, tickSize, negRisk } = req.body;
+    const { tokenId, price, size, tickSize, negRisk, orderType } = req.body;
     if (!tokenId || !price || !size) return res.status(400).json({ error: 'Missing tokenId, price, size' });
 
-    console.log(`[TRADE] BUY ${size} shares @ $${price} token=${tokenId.slice(0,10)}...`);
+    const ot = orderType === 'FOK' ? OrderType.FOK : orderType === 'GTD' ? OrderType.GTD : OrderType.GTC;
+    console.log(`[TRADE] BUY ${size} shares @ $${price} (${ot}) token=${tokenId.slice(0,10)}...`);
+
+    const orderPayload = { tokenID: tokenId, price: parseFloat(price), side: Side.BUY, size: parseFloat(size) };
+    if (ot === OrderType.GTD) orderPayload.expiration = Math.floor(Date.now() / 1000) + 300;
 
     const resp = await clobClient.createAndPostOrder(
-      { tokenID: tokenId, price: parseFloat(price), side: Side.BUY, size: parseFloat(size) },
+      orderPayload,
       { tickSize: tickSize || '0.01', negRisk: negRisk || false },
-      OrderType.GTC
+      ot
     );
 
     console.log('[TRADE] Result:', JSON.stringify(resp));
@@ -570,6 +618,9 @@ app.post('/api/sell', async (req, res) => {
     if (!clobClient) return res.status(503).json({ error: 'Client not initialized' });
     const { tokenId, price, size, tickSize, negRisk } = req.body;
     if (!tokenId || !price || !size) return res.status(400).json({ error: 'Missing tokenId, price, size' });
+    if ((parseFloat(price) * parseFloat(size)) < 0.01) {
+      return res.json({ skipped: true, reason: 'dust position' });
+    }
 
     console.log(`[TRADE] SELL ${size} shares @ $${price} token=${tokenId.slice(0,10)}...`);
 
@@ -631,10 +682,14 @@ app.post('/api/redeem', async (req, res) => {
     console.log(`[REDEEM] Confirmed! Gas used: ${receipt.gasUsed.toString()}`);
 
     // Refresh balance cache
+    providerCache = null;
+    providerCacheTime = 0;
     balanceCacheTime = 0;
 
     res.json({ tx: tx.hash, status: 'confirmed', gasUsed: receipt.gasUsed.toString() });
   } catch (e) {
+    providerCache = null;
+    providerCacheTime = 0;
     console.error('[REDEEM] Error:', e.message);
     res.status(500).json({ error: e.message });
   }
@@ -668,12 +723,16 @@ app.post('/api/redeem-all', async (req, res) => {
         console.log(`[REDEEM] ${pos.name || pos.conditionId} confirmed!`);
         results.push({ name: pos.name, conditionId: pos.conditionId, tx: tx.hash, status: 'confirmed' });
       } catch (e) {
+        providerCache = null;
+        providerCacheTime = 0;
         console.error(`[REDEEM] ${pos.name || pos.conditionId} failed:`, e.message);
         results.push({ name: pos.name, conditionId: pos.conditionId, error: e.message });
       }
     }
 
     // Refresh balance cache
+    providerCache = null;
+    providerCacheTime = 0;
     balanceCacheTime = 0;
 
     res.json({ results });

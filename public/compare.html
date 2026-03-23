@@ -1,0 +1,301 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Strategy Comparison | PM CopyTrader</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns@3.0.0/dist/chartjs-adapter-date-fns.bundle.min.js"></script>
+<style>
+:root {
+  --bg: #0a0a0f; --card: #12121a; --card2: #181824; --border: #1e1e2e;
+  --text: #e0e0e0; --dim: #666; --green: #00d4aa; --red: #ff4757;
+  --blue: #4facfe; --purple: #a855f7; --gold: #f59e0b; --cyan: #06b6d4;
+}
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { background: var(--bg); color: var(--text); font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; font-size: 14px; }
+
+.header {
+  display: flex; justify-content: space-between; align-items: center;
+  padding: 14px 24px; border-bottom: 1px solid var(--border); background: var(--card);
+}
+.header h1 { font-size: 17px; font-weight: 600; }
+.header h1 span { color: var(--dim); font-weight: 400; font-size: 13px; margin-left: 8px; }
+.header-right { display: flex; align-items: center; gap: 12px; }
+.poll-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--green); display: inline-block; animation: pulse 2s infinite; }
+@keyframes pulse { 0%,100%{opacity:1}50%{opacity:.3} }
+.refresh-label { font-size: 11px; color: var(--dim); }
+.nav-links { display: flex; gap: 8px; }
+.nav-links a { font-size: 12px; color: var(--blue); text-decoration: none; padding: 4px 10px; border: 1px solid var(--border); border-radius: 6px; }
+.nav-links a:hover { border-color: var(--blue); }
+
+.container { max-width: 1400px; margin: 0 auto; padding: 20px; }
+
+/* Summary bar */
+.summary { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 24px; }
+.summary-card { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 16px; }
+.summary-card .val { font-size: 24px; font-weight: 700; }
+.summary-card .lbl { font-size: 11px; color: var(--dim); text-transform: uppercase; margin-top: 2px; letter-spacing: .5px; }
+.pos { color: var(--green); }
+.neg { color: var(--red); }
+
+/* Chart */
+.chart-section { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 20px; margin-bottom: 24px; }
+.chart-section h2 { font-size: 14px; color: var(--dim); font-weight: 500; margin-bottom: 16px; }
+.chart-wrap { position: relative; height: 300px; }
+
+/* Leaderboard */
+.leaderboard { margin-bottom: 24px; }
+.leaderboard h2 { font-size: 14px; color: var(--dim); font-weight: 500; margin-bottom: 12px; }
+
+.lb-table { width: 100%; border-collapse: collapse; }
+.lb-table th { font-size: 11px; color: var(--dim); text-transform: uppercase; letter-spacing: .5px; padding: 10px 12px; text-align: left; border-bottom: 1px solid var(--border); font-weight: 500; }
+.lb-table td { padding: 12px; border-bottom: 1px solid var(--border); }
+.lb-table tr { background: var(--card); transition: background .15s; }
+.lb-table tr:hover { background: var(--card2); }
+
+.rank { width: 40px; text-align: center; font-weight: 700; font-size: 16px; }
+.rank-1 { color: var(--gold); }
+.rank-2 { color: #c0c0c0; }
+.rank-3 { color: #cd7f32; }
+
+.strat-name { font-weight: 600; font-size: 14px; }
+.strat-target { font-size: 11px; color: var(--dim); }
+.strat-target a { color: var(--blue); text-decoration: none; }
+
+.metric { text-align: right; font-variant-numeric: tabular-nums; }
+.metric .main { font-size: 15px; font-weight: 600; }
+.metric .sub { font-size: 11px; color: var(--dim); }
+
+.pnl-bar { height: 6px; border-radius: 3px; margin-top: 6px; }
+.pnl-bar-pos { background: var(--green); }
+.pnl-bar-neg { background: var(--red); }
+
+.budget-bar { height: 4px; background: var(--border); border-radius: 2px; margin-top: 4px; overflow: hidden; }
+.budget-fill { height: 100%; border-radius: 2px; background: var(--blue); }
+
+/* Recent trades */
+.recent-section { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 20px; }
+.recent-section h2 { font-size: 14px; color: var(--dim); font-weight: 500; margin-bottom: 12px; }
+.trade-row { display: flex; align-items: center; gap: 12px; padding: 8px 0; border-bottom: 1px solid var(--border); font-size: 13px; }
+.trade-row:last-child { border: none; }
+.trade-time { color: var(--dim); font-size: 11px; min-width: 50px; }
+.trade-strat { font-size: 11px; background: var(--card2); padding: 2px 8px; border-radius: 4px; color: var(--blue); min-width: 80px; text-align: center; }
+.trade-side { font-size: 11px; font-weight: 600; padding: 2px 6px; border-radius: 3px; min-width: 36px; text-align: center; }
+.trade-side.buy { background: rgba(0,212,170,.15); color: var(--green); }
+.trade-side.sell { background: rgba(255,71,87,.15); color: var(--red); }
+.trade-title { flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.trade-outcome { color: var(--cyan); font-size: 12px; }
+.trade-amount { font-variant-numeric: tabular-nums; min-width: 60px; text-align: right; }
+.trade-pnl { font-variant-numeric: tabular-nums; min-width: 60px; text-align: right; font-weight: 600; }
+
+@media (max-width: 768px) {
+  .summary { grid-template-columns: repeat(2, 1fr); }
+  .lb-table th:nth-child(n+5), .lb-table td:nth-child(n+5) { display: none; }
+}
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1>Strategy Comparison <span>Paper Trading - 100 per strategy</span></h1>
+  <div class="header-right">
+    <div class="nav-links">
+      <a href="/">Paper Trades</a>
+      <a href="/live.html">Live Trading</a>
+    </div>
+    <span class="poll-dot"></span>
+    <span class="refresh-label">Live</span>
+  </div>
+</div>
+
+<div class="container">
+  <div class="summary" id="summary"></div>
+
+  <div class="chart-section">
+    <h2>P&L Over Time (all strategies)</h2>
+    <div class="chart-wrap"><canvas id="pnlChart"></canvas></div>
+  </div>
+
+  <div class="leaderboard">
+    <h2>Strategy Leaderboard</h2>
+    <table class="lb-table">
+      <thead>
+        <tr>
+          <th>#</th>
+          <th>Strategy</th>
+          <th style="text-align:right">Portfolio</th>
+          <th style="text-align:right">P&L</th>
+          <th style="text-align:right">ROI</th>
+          <th style="text-align:right">Win Rate</th>
+          <th style="text-align:right">Trades</th>
+          <th style="text-align:right">Budget Used</th>
+        </tr>
+      </thead>
+      <tbody id="leaderboard"></tbody>
+    </table>
+  </div>
+
+  <div class="recent-section">
+    <h2>Recent Trades (all strategies)</h2>
+    <div id="recentTrades"></div>
+  </div>
+</div>
+
+<script>
+const COLORS = ['#4facfe','#00d4aa','#a855f7','#f59e0b','#ff4757','#06b6d4','#ec4899','#84cc16','#f97316','#6366f1'];
+let pnlChart = null;
+
+async function api(path) {
+  const r = await fetch('/api' + path);
+  return r.json();
+}
+
+function fmt(n, decimals = 2) {
+  return (n >= 0 ? '' : '-') + '\u20AC' + Math.abs(n).toFixed(decimals);
+}
+
+async function loadAll() {
+  const [stats, trades] = await Promise.all([
+    api('/stats'),
+    api('/trades?limit=50'),
+  ]);
+
+  // Summary
+  const c = stats.combined;
+  document.getElementById('summary').innerHTML = `
+    <div class="summary-card">
+      <div class="val">${stats.strategies.length}</div>
+      <div class="lbl">Strategies</div>
+    </div>
+    <div class="summary-card">
+      <div class="val ${c.total_pnl >= 0 ? 'pos' : 'neg'}">${fmt(c.total_pnl)}</div>
+      <div class="lbl">Combined P&L</div>
+    </div>
+    <div class="summary-card">
+      <div class="val">${c.total_trades}</div>
+      <div class="lbl">Total Trades</div>
+    </div>
+    <div class="summary-card">
+      <div class="val">${c.win_rate}%</div>
+      <div class="lbl">Avg Win Rate</div>
+    </div>
+  `;
+
+  // Leaderboard (sorted by P&L)
+  const sorted = [...stats.strategies].sort((a, b) => b.total_pnl - a.total_pnl);
+  const maxPnl = Math.max(...sorted.map(s => Math.abs(s.total_pnl)), 1);
+
+  document.getElementById('leaderboard').innerHTML = sorted.map((s, i) => {
+    const rank = i + 1;
+    const rankClass = rank <= 3 ? `rank-${rank}` : '';
+    const pnlClass = s.total_pnl >= 0 ? 'pos' : 'neg';
+    const barClass = s.total_pnl >= 0 ? 'pnl-bar-pos' : 'pnl-bar-neg';
+    const barWidth = Math.min(100, (Math.abs(s.total_pnl) / maxPnl) * 100);
+    const budget = s.paper_budget || 100;
+    const spent = s.total_notional || 0;
+    const budgetPct = Math.min(100, (spent / budget) * 100);
+    const portfolioClass = s.portfolio_value >= budget ? 'pos' : 'neg';
+
+    return `<tr>
+      <td class="rank ${rankClass}">${rank}</td>
+      <td>
+        <div class="strat-name">${s.target_name}</div>
+        <div class="strat-target"><a href="${s.target_url}" target="_blank">View on Polymarket</a></div>
+      </td>
+      <td class="metric">
+        <div class="main ${portfolioClass}">${fmt(s.portfolio_value || budget)}</div>
+        <div class="sub">started ${fmt(budget)}</div>
+      </td>
+      <td class="metric">
+        <div class="main ${pnlClass}">${s.total_pnl >= 0 ? '+' : ''}${fmt(s.total_pnl)}</div>
+        <div class="pnl-bar ${barClass}" style="width:${barWidth}%"></div>
+      </td>
+      <td class="metric">
+        <div class="main ${pnlClass}">${s.roi >= 0 ? '+' : ''}${s.roi}%</div>
+        <div class="sub">return</div>
+      </td>
+      <td class="metric">
+        <div class="main">${s.win_rate}%</div>
+        <div class="sub">${s.total_trades} trades</div>
+      </td>
+      <td class="metric">
+        <div class="main">${s.total_trades}</div>
+        <div class="sub">${s.open_trades} open</div>
+      </td>
+      <td class="metric">
+        <div class="main">${fmt(spent)} / ${fmt(budget)}</div>
+        <div class="budget-bar"><div class="budget-fill" style="width:${budgetPct}%"></div></div>
+      </td>
+    </tr>`;
+  }).join('');
+
+  // Recent trades
+  document.getElementById('recentTrades').innerHTML = trades.slice(0, 30).map(t => {
+    const time = new Date(t.timestamp).toLocaleTimeString('nl-NL', { hour: '2-digit', minute: '2-digit' });
+    const pnlClass = (t.pnl || 0) >= 0 ? 'pos' : 'neg';
+    return `<div class="trade-row">
+      <span class="trade-time">${time}</span>
+      <span class="trade-strat">${t.strategy_name.replace('Copy ','')}</span>
+      <span class="trade-side ${t.side.toLowerCase()}">${t.side}</span>
+      <span class="trade-outcome">${t.outcome}</span>
+      <span class="trade-title">${t.title}</span>
+      <span class="trade-amount">${fmt(t.notional)}</span>
+      <span class="trade-pnl ${pnlClass}">${t.pnl >= 0 ? '+' : ''}${fmt(t.pnl)}</span>
+    </div>`;
+  }).join('');
+
+  // PnL chart
+  await loadChart(stats.strategies);
+}
+
+async function loadChart(strategies) {
+  const datasets = [];
+  const fetches = strategies.map(s =>
+    api(`/pnl-history?strategy_id=${s.strategy_id}&hours=168`)
+  );
+  const allData = await Promise.all(fetches);
+
+  strategies.forEach((s, i) => {
+    const snapshots = allData[i];
+    if (!snapshots || !snapshots.length) return;
+    datasets.push({
+      label: s.target_name,
+      data: snapshots.map(p => ({ x: new Date(p.timestamp), y: p.total_pnl })),
+      borderColor: COLORS[i % COLORS.length],
+      backgroundColor: 'transparent',
+      borderWidth: 2,
+      pointRadius: 0,
+      tension: 0.3,
+    });
+  });
+
+  if (pnlChart) pnlChart.destroy();
+  pnlChart = new Chart(document.getElementById('pnlChart'), {
+    type: 'line',
+    data: { datasets },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      interaction: { mode: 'index', intersect: false },
+      plugins: {
+        legend: { position: 'top', labels: { color: '#999', boxWidth: 12, font: { size: 11 } } },
+        tooltip: {
+          callbacks: {
+            label: ctx => `${ctx.dataset.label}: ${ctx.parsed.y >= 0 ? '+' : ''}\u20AC${ctx.parsed.y.toFixed(2)}`
+          }
+        }
+      },
+      scales: {
+        x: { type: 'time', time: { unit: 'hour' }, grid: { color: '#1e1e2e' }, ticks: { color: '#666', font: { size: 10 } } },
+        y: { grid: { color: '#1e1e2e' }, ticks: { color: '#666', callback: v => '\u20AC' + v } }
+      }
+    }
+  });
+}
+
+loadAll();
+setInterval(loadAll, 15000);
+</script>
+</body>
+</html>

@@ -1,0 +1,289 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>My Bot | Paper Trading</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns@3.0.0/dist/chartjs-adapter-date-fns.bundle.min.js"></script>
+<style>
+:root {
+  --bg: #0a0a0f; --card: #12121a; --card2: #181824; --border: #1e1e2e;
+  --text: #e0e0e0; --dim: #666; --green: #00d4aa; --red: #ff4757;
+  --blue: #4facfe; --purple: #a855f7; --gold: #f59e0b; --cyan: #06b6d4;
+}
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { background: var(--bg); color: var(--text); font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; font-size: 14px; }
+
+.header {
+  display: flex; justify-content: space-between; align-items: center;
+  padding: 14px 24px; border-bottom: 1px solid var(--border); background: var(--card);
+}
+.header h1 { font-size: 17px; font-weight: 600; }
+.header h1 .sub { color: var(--dim); font-weight: 400; font-size: 13px; margin-left: 8px; }
+.header-right { display: flex; align-items: center; gap: 12px; }
+.poll-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--green); display: inline-block; animation: pulse 2s infinite; }
+@keyframes pulse { 0%,100%{opacity:1}50%{opacity:.3} }
+
+.container { max-width: 1200px; margin: 0 auto; padding: 20px; }
+
+.top-stats { display: grid; grid-template-columns: repeat(5, 1fr); gap: 12px; margin-bottom: 24px; }
+.stat-card { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 18px; }
+.stat-card .val { font-size: 26px; font-weight: 700; line-height: 1.2; }
+.stat-card .lbl { font-size: 11px; color: var(--dim); text-transform: uppercase; margin-top: 4px; letter-spacing: .5px; }
+.pos { color: var(--green); }
+.neg { color: var(--red); }
+
+.split-row { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 24px; }
+.bot-card { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 18px; }
+.bot-card h3 { font-size: 14px; margin-bottom: 12px; display: flex; justify-content: space-between; align-items: center; }
+.bot-card h3 .pnl { font-size: 18px; font-weight: 700; }
+.bot-stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+.bot-stat .val { font-size: 16px; font-weight: 600; }
+.bot-stat .lbl { font-size: 10px; color: var(--dim); text-transform: uppercase; }
+
+.chart-section { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 20px; margin-bottom: 24px; }
+.chart-section h2 { font-size: 14px; color: var(--dim); font-weight: 500; margin-bottom: 16px; }
+.chart-wrap { position: relative; height: 280px; }
+
+.positions-section { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 20px; margin-bottom: 24px; }
+.positions-section h2 { font-size: 14px; color: var(--dim); font-weight: 500; margin-bottom: 12px; }
+.pos-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 10px; }
+.pos-card { background: var(--card2); border: 1px solid var(--border); border-radius: 8px; padding: 12px; }
+.pos-card .title { font-size: 13px; font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-bottom: 4px; }
+.pos-card .outcome { font-size: 11px; color: var(--cyan); margin-bottom: 6px; }
+.pos-card .row { display: flex; justify-content: space-between; font-size: 12px; }
+.pos-card .row .lbl { color: var(--dim); }
+
+.trades-section { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 20px; }
+.trades-section h2 { font-size: 14px; color: var(--dim); font-weight: 500; margin-bottom: 12px; }
+.trade-row { display: flex; align-items: center; gap: 10px; padding: 8px 0; border-bottom: 1px solid var(--border); font-size: 13px; }
+.trade-row:last-child { border: none; }
+.trade-time { color: var(--dim); font-size: 11px; min-width: 70px; }
+.trade-bot { font-size: 10px; background: var(--card2); padding: 2px 6px; border-radius: 3px; color: var(--blue); }
+.trade-side { font-size: 11px; font-weight: 600; padding: 2px 6px; border-radius: 3px; }
+.trade-side.buy { background: rgba(0,212,170,.15); color: var(--green); }
+.trade-side.sell { background: rgba(255,71,87,.15); color: var(--red); }
+.trade-info { flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.trade-info .outcome { color: var(--cyan); }
+.trade-amount { min-width: 50px; text-align: right; font-variant-numeric: tabular-nums; }
+.trade-pnl { min-width: 60px; text-align: right; font-weight: 600; font-variant-numeric: tabular-nums; }
+
+@media (max-width: 768px) {
+  .top-stats { grid-template-columns: repeat(2, 1fr); }
+  .split-row { grid-template-columns: 1fr; }
+}
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1>My Bot <span class="sub">Paper Trading &mdash; $1 bets, $100 budget</span></h1>
+  <div class="header-right">
+    <span class="poll-dot"></span>
+    <span style="font-size:11px;color:var(--dim)">Auto-refresh 15s</span>
+  </div>
+</div>
+
+<div class="container">
+  <div class="top-stats" id="topStats"></div>
+  <div class="split-row" id="botCards"></div>
+  <div class="chart-section">
+    <h2>Portfolio Value Over Time</h2>
+    <div class="chart-wrap"><canvas id="chart"></canvas></div>
+  </div>
+  <div class="positions-section">
+    <h2>Open Positions</h2>
+    <div class="pos-grid" id="positions"></div>
+  </div>
+  <div class="trades-section">
+    <h2>Recent Trades</h2>
+    <div id="trades"></div>
+  </div>
+</div>
+
+<script>
+const MY_BOT_IDS = [];
+const START_BUDGET = 100;
+let chart = null;
+
+function fmt(n) { return (n >= 0 ? '' : '-') + '$' + Math.abs(n).toFixed(2); }
+function pnlClass(n) { return n >= 0 ? 'pos' : 'neg'; }
+
+async function api(path) { return (await fetch('/api' + path)).json(); }
+
+async function init() {
+  const stats = await api('/stats');
+  for (const s of stats.strategies) {
+    if (s.strategy_name.startsWith('My Bot')) MY_BOT_IDS.push(s.strategy_id);
+  }
+  if (MY_BOT_IDS.length === 0) {
+    document.querySelector('.container').innerHTML = '<p style="padding:40px;color:var(--dim)">No "My Bot" strategies found.</p>';
+    return;
+  }
+  await loadAll();
+  setInterval(loadAll, 15000);
+}
+
+async function loadAll() {
+  const stats = await api('/stats');
+  const myBots = stats.strategies.filter(s => MY_BOT_IDS.includes(s.strategy_id));
+
+  // Combined stats
+  const totalPnl = myBots.reduce((s, b) => s + b.total_pnl, 0);
+  const totalTrades = myBots.reduce((s, b) => s + b.total_trades, 0);
+  const openTrades = myBots.reduce((s, b) => s + b.open_trades, 0);
+  const totalWins = myBots.reduce((s, b) => s + Math.round(b.win_rate * b.total_trades / 100), 0);
+  const winRate = totalTrades > 0 ? Math.round(totalWins / totalTrades * 100) : 0;
+  const portfolio = START_BUDGET + totalPnl;
+  const roi = ((totalPnl / START_BUDGET) * 100).toFixed(2);
+
+  document.getElementById('topStats').innerHTML = `
+    <div class="stat-card">
+      <div class="val ${pnlClass(portfolio - START_BUDGET)}">${fmt(portfolio)}</div>
+      <div class="lbl">Portfolio Value</div>
+    </div>
+    <div class="stat-card">
+      <div class="val ${pnlClass(totalPnl)}">${totalPnl >= 0 ? '+' : ''}${fmt(totalPnl)}</div>
+      <div class="lbl">Total P&L</div>
+    </div>
+    <div class="stat-card">
+      <div class="val ${pnlClass(totalPnl)}">${roi >= 0 ? '+' : ''}${roi}%</div>
+      <div class="lbl">ROI</div>
+    </div>
+    <div class="stat-card">
+      <div class="val">${totalTrades}</div>
+      <div class="lbl">Total Trades (${openTrades} open)</div>
+    </div>
+    <div class="stat-card">
+      <div class="val">${winRate}%</div>
+      <div class="lbl">Win Rate</div>
+    </div>
+  `;
+
+  // Per-bot cards
+  document.getElementById('botCards').innerHTML = myBots.map(b => {
+    const botPnl = b.total_pnl;
+    const botPortfolio = (b.paper_budget || 50) + botPnl;
+    return `<div class="bot-card">
+      <h3>${b.target_name} <span class="pnl ${pnlClass(botPnl)}">${botPnl >= 0 ? '+' : ''}${fmt(botPnl)}</span></h3>
+      <div class="bot-stats">
+        <div class="bot-stat"><div class="val">${fmt(botPortfolio)}</div><div class="lbl">Portfolio</div></div>
+        <div class="bot-stat"><div class="val">${b.total_trades}</div><div class="lbl">Trades</div></div>
+        <div class="bot-stat"><div class="val">${b.win_rate}%</div><div class="lbl">Win Rate</div></div>
+      </div>
+    </div>`;
+  }).join('');
+
+  // Trades
+  const tradePromises = MY_BOT_IDS.map(id => api(`/trades?strategy_id=${id}&limit=30`));
+  const tradeResults = await Promise.all(tradePromises);
+  const allTrades = tradeResults.flat().sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp)).slice(0, 40);
+
+  document.getElementById('trades').innerHTML = allTrades.map(t => {
+    const d = new Date(t.timestamp);
+    const time = d.toLocaleDateString('nl-NL', {day:'numeric',month:'short'}) + ' ' + d.toLocaleTimeString('nl-NL', {hour:'2-digit',minute:'2-digit'});
+    const bot = t.strategy_name.replace('My Bot - ', '');
+    return `<div class="trade-row">
+      <span class="trade-time">${time}</span>
+      <span class="trade-bot">${bot}</span>
+      <span class="trade-side ${t.side.toLowerCase()}">${t.side}</span>
+      <span class="trade-info"><span class="outcome">${t.outcome}</span> ${t.title}</span>
+      <span class="trade-amount">${fmt(t.notional)}</span>
+      <span class="trade-pnl ${pnlClass(t.pnl)}">${t.pnl >= 0 ? '+' : ''}${fmt(t.pnl)}</span>
+    </div>`;
+  }).join('');
+
+  // Open positions (trades with positive PnL direction or open status)
+  const openPositions = allTrades.filter(t => t.status === 'open');
+  const posMap = new Map();
+  for (const t of openPositions) {
+    const key = t.token_id;
+    if (!posMap.has(key)) posMap.set(key, { title: t.title, outcome: t.outcome, side: t.side, size: 0, cost: 0, pnl: 0, curPrice: t.current_price, entryPrice: t.price });
+    const p = posMap.get(key);
+    p.size += t.size;
+    p.cost += t.notional;
+    p.pnl += t.pnl;
+  }
+
+  document.getElementById('positions').innerHTML = posMap.size === 0
+    ? '<p style="color:var(--dim)">No open positions</p>'
+    : [...posMap.values()].sort((a, b) => Math.abs(b.pnl) - Math.abs(a.pnl)).slice(0, 20).map(p => `
+      <div class="pos-card">
+        <div class="title">${p.title}</div>
+        <div class="outcome">${p.side} ${p.outcome}</div>
+        <div class="row"><span class="lbl">Size</span><span>${p.size.toFixed(1)} shares</span></div>
+        <div class="row"><span class="lbl">Entry</span><span>$${p.entryPrice.toFixed(3)}</span></div>
+        <div class="row"><span class="lbl">Current</span><span>$${(p.curPrice || 0).toFixed(3)}</span></div>
+        <div class="row"><span class="lbl">P&L</span><span class="${pnlClass(p.pnl)}">${p.pnl >= 0 ? '+' : ''}${fmt(p.pnl)}</span></div>
+      </div>
+    `).join('');
+
+  // Chart
+  await loadChart();
+}
+
+async function loadChart() {
+  const datasets = [];
+  const colors = ['#4facfe', '#00d4aa'];
+
+  for (let i = 0; i < MY_BOT_IDS.length; i++) {
+    const data = await api(`/pnl-history?strategy_id=${MY_BOT_IDS[i]}&hours=168`);
+    if (data && data.length) {
+      datasets.push({
+        label: i === 0 ? 'RN1' : 'geniusMC',
+        data: data.map(p => ({ x: new Date(p.timestamp), y: (i === 0 ? 50 : 50) + p.total_pnl })),
+        borderColor: colors[i],
+        backgroundColor: 'transparent',
+        borderWidth: 2,
+        pointRadius: 0,
+        tension: 0.3,
+      });
+    }
+  }
+
+  // Combined
+  if (datasets.length === 2 && datasets[0].data.length && datasets[1].data.length) {
+    const combined = datasets[0].data.map((d, i) => ({
+      x: d.x,
+      y: d.y + (datasets[1].data[i] ? datasets[1].data[i].y - 50 : 0)
+    }));
+    datasets.unshift({
+      label: 'Combined ($100)',
+      data: combined,
+      borderColor: '#f59e0b',
+      backgroundColor: 'transparent',
+      borderWidth: 3,
+      pointRadius: 0,
+      tension: 0.3,
+    });
+  }
+
+  if (chart) chart.destroy();
+  chart = new Chart(document.getElementById('chart'), {
+    type: 'line',
+    data: { datasets },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      interaction: { mode: 'index', intersect: false },
+      plugins: {
+        legend: { position: 'top', labels: { color: '#999', boxWidth: 12, font: { size: 11 } } },
+        tooltip: { callbacks: { label: ctx => `${ctx.dataset.label}: ${fmt(ctx.parsed.y)}` } }
+      },
+      scales: {
+        x: { type: 'time', time: { unit: 'hour' }, grid: { color: '#1e1e2e' }, ticks: { color: '#666', font: { size: 10 } } },
+        y: {
+          grid: { color: '#1e1e2e' },
+          ticks: { color: '#666', callback: v => '$' + v },
+          suggestedMin: 80, suggestedMax: 120
+        }
+      }
+    }
+  });
+}
+
+init();
+</script>
+</body>
+</html>

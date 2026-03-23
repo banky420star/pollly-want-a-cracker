@@ -103,6 +103,15 @@ db.exec(`
     key TEXT PRIMARY KEY,
     value TEXT
   );
+
+  CREATE TABLE IF NOT EXISTS live_redeem_guard (
+    condition_id TEXT PRIMARY KEY,
+    market_name TEXT,
+    last_attempt_at TEXT,
+    last_success_at TEXT,
+    last_error_at TEXT,
+    last_error TEXT
+  );
 `);
 
 db.exec(`
@@ -120,6 +129,9 @@ try { db.exec('ALTER TABLE strategies ADD COLUMN live_enabled INTEGER DEFAULT 0'
 try { db.exec('ALTER TABLE strategies ADD COLUMN live_bet REAL DEFAULT 0.01'); } catch(e) {}
 try { db.exec('ALTER TABLE strategies ADD COLUMN live_budget REAL DEFAULT 0'); } catch(e) {}
 try { db.exec('ALTER TABLE strategies ADD COLUMN live_start_capital REAL DEFAULT 0'); } catch(e) {}
+
+// Paper trading budget (€100 per strategy)
+try { db.exec('ALTER TABLE strategies ADD COLUMN paper_budget REAL DEFAULT 100'); } catch(e) {}
 
 // Portfolio value tracking
 db.exec(`
@@ -290,7 +302,21 @@ async function getMarketMeta(conditionId) {
 
 const TRADING_SERVER = 'http://127.0.0.1:4001';
 const AUTO_COLLECT_PRICE = 0.99;
-const AUTO_COLLECT_COOLDOWN_MS = 15000;
+const AUTO_COLLECT_COOLDOWN_MS = 5000;
+const STALE_POSITION_HOURS = 2; // sell positions older than this
+const MIN_COLLECT_VALUE = 0.01;
+const MAX_AUTO_REDEEMS_PER_CYCLE = 100;
+const MAX_AUTO_SELLS_PER_CYCLE = 20;
+const REDEEM_SUCCESS_COOLDOWN_MS = 6 * 60 * 60 * 1000;
+const REDEEM_ERROR_COOLDOWN_MS = 10 * 60 * 1000;
+const REDEEM_ATTEMPT_COOLDOWN_MS = 2 * 60 * 1000;
+
+// Paper trading realism settings
+const TRADE_FEE_RATE = 0.01;       // 1% fee per trade (entry + exit = ~2% roundtrip)
+const SLIPPAGE_PCT = 0.01;          // 1% slippage due to 5s polling delay
+const AUTO_CLOSE_HARD = 0.98;       // hard close: market effectively resolved
+const AUTO_CLOSE_SOFT = 0.90;       // soft close: near-resolved, not much upside left
+const AUTO_CLOSE_SOFT_HOLD_MIN = 15; // minutes to hold before soft-closing
 const LIVE_STATE_CACHE_MS = 5000;
 const MAX_LIVE_TRADE_AGE_SECONDS = 90;
 const RETRY_COOLDOWN_MS = 15000;
@@ -334,6 +360,85 @@ function parseSqliteTimestamp(ts) {
   const iso = ts.includes('T') ? ts : `${ts.replace(' ', 'T')}Z`;
   const ms = Date.parse(iso);
   return Number.isNaN(ms) ? 0 : ms;
+}
+
+function getRedeemGuard(conditionId) {
+  return db.prepare(`
+    SELECT *
+    FROM live_redeem_guard
+    WHERE condition_id = ?
+  `).get(conditionId);
+}
+
+function shouldAttemptRedeem(conditionId) {
+  const guard = getRedeemGuard(conditionId);
+  if (!guard) return { ok: true };
+
+  const now = Date.now();
+  const lastAttempt = parseSqliteTimestamp(guard.last_attempt_at);
+  const lastSuccess = parseSqliteTimestamp(guard.last_success_at);
+  if (lastSuccess && (now - lastSuccess) < REDEEM_SUCCESS_COOLDOWN_MS) {
+    return {
+      ok: false,
+      reason: 'recent redeem success',
+      retry_after_ms: REDEEM_SUCCESS_COOLDOWN_MS - (now - lastSuccess),
+    };
+  }
+
+  const lastError = parseSqliteTimestamp(guard.last_error_at);
+  if (lastError && (now - lastError) < REDEEM_ERROR_COOLDOWN_MS) {
+    return {
+      ok: false,
+      reason: 'recent redeem error',
+      retry_after_ms: REDEEM_ERROR_COOLDOWN_MS - (now - lastError),
+    };
+  }
+
+  const latestOutcome = Math.max(lastSuccess, lastError);
+  if (lastAttempt && lastAttempt > latestOutcome && (now - lastAttempt) < REDEEM_ATTEMPT_COOLDOWN_MS) {
+    return {
+      ok: false,
+      reason: 'recent redeem attempt',
+      retry_after_ms: REDEEM_ATTEMPT_COOLDOWN_MS - (now - lastAttempt),
+    };
+  }
+
+  return { ok: true };
+}
+
+function markRedeemAttempt(conditionId, marketName = '') {
+  db.prepare(`
+    INSERT INTO live_redeem_guard (condition_id, market_name, last_attempt_at)
+    VALUES (?, ?, datetime('now'))
+    ON CONFLICT(condition_id) DO UPDATE SET
+      market_name = excluded.market_name,
+      last_attempt_at = excluded.last_attempt_at
+  `).run(conditionId, marketName);
+}
+
+function markRedeemSuccess(conditionId, marketName = '') {
+  db.prepare(`
+    INSERT INTO live_redeem_guard (condition_id, market_name, last_attempt_at, last_success_at, last_error, last_error_at)
+    VALUES (?, ?, datetime('now'), datetime('now'), NULL, NULL)
+    ON CONFLICT(condition_id) DO UPDATE SET
+      market_name = excluded.market_name,
+      last_attempt_at = excluded.last_attempt_at,
+      last_success_at = excluded.last_success_at,
+      last_error = NULL,
+      last_error_at = NULL
+  `).run(conditionId, marketName);
+}
+
+function markRedeemError(conditionId, marketName = '', error = '') {
+  db.prepare(`
+    INSERT INTO live_redeem_guard (condition_id, market_name, last_attempt_at, last_error_at, last_error)
+    VALUES (?, ?, datetime('now'), datetime('now'), ?)
+    ON CONFLICT(condition_id) DO UPDATE SET
+      market_name = excluded.market_name,
+      last_attempt_at = excluded.last_attempt_at,
+      last_error_at = excluded.last_error_at,
+      last_error = excluded.last_error
+  `).run(conditionId, marketName, error);
 }
 
 function getTradeTimestampMs(trade) {
@@ -382,6 +487,23 @@ function getPositionCurrentValue(position) {
 
 function isCollectablePosition(position) {
   return !!position.redeemable || getPositionPrice(position) >= AUTO_COLLECT_PRICE;
+}
+
+function isStalePosition(position) {
+  const tokenId = String(position.asset);
+  const oldest = db.prepare(
+    "SELECT MIN(timestamp) as oldest FROM live_trades WHERE token_id = ? AND status = 'filled' AND side = 'BUY'"
+  ).get(tokenId);
+  if (!oldest || !oldest.oldest) return false;
+  const ageMs = Date.now() - new Date(oldest.oldest).getTime();
+  if (ageMs <= STALE_POSITION_HOURS * 60 * 60 * 1000) return false;
+
+  // Only sell if price hasn't moved much (max $0.05 change from buy price)
+  const avgPrice = toNumber(position.avgPrice ?? position.avg_price);
+  const curPrice = getPositionPrice(position);
+  if (!avgPrice || !curPrice) return false;
+  const priceChange = Math.abs(curPrice - avgPrice);
+  return priceChange <= 0.05;
 }
 
 async function getTradingPositions() {
@@ -454,15 +576,24 @@ async function collectLivePositions(reason = 'manual') {
   const sellablePositions = [];
   const results = [];
 
+  const stalePositions = [];
+  const isManualCollect = reason === 'manual';
+
   for (const position of positions) {
-    if (getPositionSize(position) <= 0 || !isCollectablePosition(position)) continue;
+    if (getPositionSize(position) <= 0) continue;
+    const currentValue = getPositionCurrentValue(position);
 
     if (position.redeemable) {
+      if (currentValue < MIN_COLLECT_VALUE) {
+        continue;
+      }
       if (!redeemMap.has(position.conditionId)) {
         redeemMap.set(position.conditionId, {
           conditionId: position.conditionId,
           negRisk: !!position.negativeRisk,
           name: `${position.title} | ${position.outcome}`,
+          currentValue,
+          currentPrice: getPositionPrice(position),
         });
       }
       continue;
@@ -479,17 +610,63 @@ async function collectLivePositions(reason = 'manual') {
       continue;
     }
 
-    sellablePositions.push(position);
+    if (isCollectablePosition(position)) {
+      if (currentValue < MIN_COLLECT_VALUE) {
+        results.push({
+          action: 'sell',
+          title: position.title,
+          outcome: position.outcome,
+          skipped: true,
+          reason: 'dust position',
+        });
+        continue;
+      }
+      sellablePositions.push(position);
+    } else if (isStalePosition(position)) {
+      stalePositions.push(position);
+    }
   }
 
   if (redeemMap.size) {
+    const redeemTargets = Array.from(redeemMap.values())
+      .sort((a, b) => {
+        if (b.currentPrice !== a.currentPrice) return b.currentPrice - a.currentPrice;
+        return b.currentValue - a.currentValue;
+      });
+    const filteredRedeemTargets = redeemTargets.filter(pos => {
+      const gate = shouldAttemptRedeem(pos.conditionId);
+      if (!gate.ok) {
+        results.push({
+          action: 'redeem',
+          title: pos.name || pos.conditionId,
+          skipped: true,
+          reason: gate.reason,
+        });
+      }
+      return gate.ok;
+    });
     try {
+      if (filteredRedeemTargets.length === 0) {
+        // Nothing left to attempt after cooldown/dedupe filtering.
+      } else {
+      for (const pos of filteredRedeemTargets) {
+        markRedeemAttempt(pos.conditionId, pos.name || pos.conditionId);
+      }
       const redeemResponse = await tradingFetchJson('/api/redeem-all', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ positions: Array.from(redeemMap.values()) }),
+        body: JSON.stringify({
+          positions: isManualCollect
+            ? filteredRedeemTargets
+            : filteredRedeemTargets.slice(0, MAX_AUTO_REDEEMS_PER_CYCLE),
+        }),
       });
       for (const item of redeemResponse.results || []) {
+        if (item.status === 'confirmed') {
+          markRedeemSuccess(item.conditionId, item.name || item.conditionId);
+        } else if (item.error) {
+          markRedeemError(item.conditionId, item.name || item.conditionId, item.error);
+        }
         results.push({
           action: 'redeem',
           title: item.name || item.conditionId,
@@ -498,12 +675,23 @@ async function collectLivePositions(reason = 'manual') {
           error: item.error,
         });
       }
+      }
     } catch (e) {
+      for (const pos of filteredRedeemTargets) {
+        markRedeemError(pos.conditionId, pos.name || pos.conditionId, e.message);
+      }
       results.push({ action: 'redeem', error: e.message, reason });
     }
   }
 
-  for (const position of sellablePositions) {
+  const positionsToSell = isManualCollect
+    ? sellablePositions.slice().sort((a, b) => getPositionCurrentValue(b) - getPositionCurrentValue(a))
+    : sellablePositions
+        .slice()
+        .sort((a, b) => getPositionCurrentValue(b) - getPositionCurrentValue(a))
+        .slice(0, MAX_AUTO_SELLS_PER_CYCLE);
+
+  for (const position of positionsToSell) {
     try {
       const sellResponse = await tradingFetchJson('/api/sell', {
         method: 'POST',
@@ -534,6 +722,41 @@ async function collectLivePositions(reason = 'manual') {
     }
   }
 
+  // Sell stale positions at current market price
+  for (const position of stalePositions) {
+    const curPrice = getPositionPrice(position);
+    if (curPrice <= 0.01) continue; // not worth selling
+    const sellPrice = Math.max(0.01, Math.floor(curPrice * 100) / 100); // round down to tick
+    try {
+      const sellResponse = await tradingFetchJson('/api/sell', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          tokenId: position.asset,
+          price: sellPrice,
+          size: getPositionSize(position),
+          negRisk: !!position.negativeRisk,
+        }),
+      });
+      results.push({
+        action: 'sell-stale',
+        title: position.title,
+        outcome: position.outcome,
+        price: sellPrice,
+        success: !!(sellResponse.orderID || sellResponse.tx),
+        orderID: sellResponse.orderID,
+      });
+      console.log(`[COLLECT] STALE SELL: ${position.title} | ${position.outcome} @ $${sellPrice} (${getPositionSize(position)} shares)`);
+    } catch (e) {
+      results.push({
+        action: 'sell-stale',
+        title: position.title,
+        outcome: position.outcome,
+        error: e.message,
+      });
+    }
+  }
+
   invalidateLiveState();
   console.log(`[COLLECT] ${reason}: ${results.length} actions`);
   return results;
@@ -549,8 +772,9 @@ async function maybeAutoCollectPositions(reason = 'auto', force = false) {
   lastAutoCollectAt = now;
   autoCollectPromise = (async () => {
     const state = await getLiveState(true);
-    if (!state.collectableCount) {
-      return { skipped: true, reason: 'no collectable positions' };
+    const hasStale = state.positions.some(p => getPositionSize(p) > 0 && isStalePosition(p));
+    if (!state.collectableCount && !hasStale) {
+      return { skipped: true, reason: 'no collectable or stale positions' };
     }
     const results = await collectLivePositions(reason);
     return {
@@ -886,12 +1110,7 @@ async function processPaperTrade(strategy, target, trade) {
 
   const targetSize = parseFloat(trade.size) || 0;
   const targetPrice = parseFloat(trade.price) || 0;
-  const targetUsdcSize = parseFloat(trade.usdcSize) || 0;
   if (targetSize === 0 || targetPrice === 0) return;
-
-  // Flat €10 per trade
-  const notional = strategy.flat_bet;
-  const size = Math.round((notional / targetPrice) * 100) / 100;
 
   // Check for duplicate (same target tx)
   const txHash = trade.transactionHash || '';
@@ -900,34 +1119,85 @@ async function processPaperTrade(strategy, target, trade) {
     if (dup) return;
   }
 
-  // Convert unix timestamp to ISO for display
   const tradeTime = trade.timestamp
     ? new Date(parseInt(trade.timestamp) * 1000).toISOString()
     : new Date().toISOString();
+
+  // === SELL: close matching open BUY position ===
+  if (side === 'SELL') {
+    const tokenId = trade.asset || '';
+    const openBuy = db.prepare(
+      "SELECT * FROM paper_trades WHERE strategy_id = ? AND token_id = ? AND side = 'BUY' AND status = 'open' ORDER BY timestamp ASC LIMIT 1"
+    ).get(strategy.id, tokenId);
+    if (!openBuy) return; // no position to sell
+
+    // Apply slippage: we sell after target, price slightly worse
+    const sellPrice = Math.max(targetPrice * (1 - SLIPPAGE_PCT), 0.01);
+    const grossPnl = (sellPrice - openBuy.price) * openBuy.size;
+    const entryFee = openBuy.notional * TRADE_FEE_RATE;
+    const exitValue = sellPrice * openBuy.size;
+    const exitFee = exitValue * TRADE_FEE_RATE;
+    const pnl = Math.round((grossPnl - entryFee - exitFee) * 100) / 100;
+
+    // Close the BUY trade with realized PnL (fees + slippage included)
+    db.prepare('UPDATE paper_trades SET status = ?, current_price = ?, pnl = ? WHERE id = ?')
+      .run('closed', sellPrice, pnl, openBuy.id);
+
+    // Insert SELL record for display (pnl=0, notional=0 to avoid double-counting)
+    db.prepare(`
+      INSERT INTO paper_trades (strategy_id, target_id, market_slug, condition_id, token_id, title, outcome, side, size, price, notional, target_tx, target_size, target_price, timestamp, current_price, pnl, status)
+      VALUES (?, ?, ?, ?, ?, ?, ?, 'SELL', ?, ?, 0, ?, ?, ?, ?, ?, 0, 'closed')
+    `).run(
+      strategy.id, target.id,
+      trade.slug || trade.market_slug || '', trade.conditionId || '', tokenId,
+      trade.title || '', trade.outcome || '',
+      openBuy.size, sellPrice,
+      txHash, targetSize, targetPrice, tradeTime, sellPrice
+    );
+
+    console.log(`[PAPER] ${strategy.name} | SELL "${trade.outcome || ''}" @ $${sellPrice.toFixed(3)} (slip from $${targetPrice.toFixed(3)}) | PnL: $${pnl.toFixed(2)} (fees: $${(entryFee+exitFee).toFixed(3)}) | ${trade.title || ''}`);
+    return;
+  }
+
+  // === BUY ===
+  // Apply slippage: we buy after target, price slightly worse (higher)
+  const entryPrice = Math.min(targetPrice * (1 + SLIPPAGE_PCT), 0.99);
+  const notional = strategy.flat_bet;
+  const size = Math.round((notional / entryPrice) * 100) / 100;
+
+  // Don't buy if already holding this token (no duplicate positions)
+  const existingPos = db.prepare(
+    "SELECT id FROM paper_trades WHERE strategy_id = ? AND token_id = ? AND side = 'BUY' AND status = 'open' LIMIT 1"
+  ).get(strategy.id, trade.asset || '');
+  if (existingPos) return;
+
+  // Check paper budget: cash = budget - invested + returned_from_closed
+  if (strategy.paper_budget > 0) {
+    const totalBought = db.prepare(
+      "SELECT COALESCE(SUM(notional), 0) as total FROM paper_trades WHERE strategy_id = ? AND side = 'BUY'"
+    ).get(strategy.id).total || 0;
+    const totalReturned = db.prepare(
+      "SELECT COALESCE(SUM(notional + pnl), 0) as total FROM paper_trades WHERE strategy_id = ? AND side = 'BUY' AND status = 'closed'"
+    ).get(strategy.id).total || 0;
+    const remaining = strategy.paper_budget - totalBought + totalReturned;
+    if (remaining < notional) {
+      console.log(`[PAPER] ${strategy.name} | BUDGET BLOCKED: $${remaining.toFixed(2)} remaining < $${notional} needed`);
+      return;
+    }
+  }
 
   const ptInfo = db.prepare(`
     INSERT INTO paper_trades (strategy_id, target_id, market_slug, condition_id, token_id, title, outcome, side, size, price, notional, target_tx, target_size, target_price, timestamp, current_price, pnl)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
   `).run(
-    strategy.id,
-    target.id,
-    trade.slug || trade.market_slug || '',
-    trade.conditionId || '',
-    trade.asset || '',
-    trade.title || '',
-    trade.outcome || '',
-    side,
-    Math.round(size * 100) / 100,
-    targetPrice,
-    notional,
-    txHash,
-    targetSize,
-    targetPrice,
-    tradeTime,
-    targetPrice
+    strategy.id, target.id,
+    trade.slug || trade.market_slug || '', trade.conditionId || '', trade.asset || '',
+    trade.title || '', trade.outcome || '',
+    side, Math.round(size * 100) / 100, entryPrice, notional,
+    txHash, targetSize, targetPrice, tradeTime, entryPrice
   );
 
-  console.log(`[PAPER] ${strategy.name} | ${side} "${trade.outcome || ''}" @ $${targetPrice.toFixed(3)} | €${notional} | ${trade.title || ''}`);
+  console.log(`[PAPER] ${strategy.name} | BUY "${trade.outcome || ''}" @ $${entryPrice.toFixed(3)} (target $${targetPrice.toFixed(3)}, +${(SLIPPAGE_PCT*100).toFixed(0)}% slip) | $${notional} | ${trade.title || ''}`);
 
   // Execute live trade if this strategy has live trading enabled
   try {
@@ -1022,13 +1292,40 @@ async function updateAllPnL() {
       const curPrice = priceCache[trade.token_id];
       if (curPrice === 0) continue;
 
-      const pnl = trade.side === 'BUY'
+      // Gross PnL
+      const grossPnl = trade.side === 'BUY'
         ? (curPrice - trade.price) * trade.size
         : (trade.price - curPrice) * trade.size;
 
-      db.prepare('UPDATE paper_trades SET current_price = ?, pnl = ? WHERE id = ?').run(
-        curPrice, Math.round(pnl * 100) / 100, trade.id
-      );
+      // Subtract fees: entry fee + estimated exit fee
+      const entryFee = (trade.notional || 0) * TRADE_FEE_RATE;
+      const currentValue = curPrice * trade.size;
+      const exitFee = currentValue * TRADE_FEE_RATE;
+      const netPnl = grossPnl - entryFee - exitFee;
+      const roundedPnl = Math.round(netPnl * 100) / 100;
+
+      // Determine if we should auto-close this trade
+      const tradeAgeMs = Date.now() - new Date(trade.timestamp).getTime();
+      const tradeAgeMin = tradeAgeMs / 60000;
+      const shouldHardClose = curPrice >= AUTO_CLOSE_HARD || curPrice <= (1 - AUTO_CLOSE_HARD);
+      const shouldSoftClose = (curPrice >= AUTO_CLOSE_SOFT || curPrice <= (1 - AUTO_CLOSE_SOFT))
+        && tradeAgeMin >= AUTO_CLOSE_SOFT_HOLD_MIN;
+
+      if (shouldHardClose || shouldSoftClose) {
+        // Apply exit slippage for soft-close (selling at market, slight slippage)
+        const closePrice = shouldHardClose ? curPrice : curPrice * (curPrice >= AUTO_CLOSE_SOFT ? (1 - SLIPPAGE_PCT) : (1 + SLIPPAGE_PCT));
+        const closePnl = trade.side === 'BUY'
+          ? (closePrice - trade.price) * trade.size - entryFee - (closePrice * trade.size * TRADE_FEE_RATE)
+          : (trade.price - closePrice) * trade.size - entryFee - (closePrice * trade.size * TRADE_FEE_RATE);
+        const roundedClosePnl = Math.round(closePnl * 100) / 100;
+        db.prepare('UPDATE paper_trades SET current_price = ?, pnl = ?, status = ? WHERE id = ?').run(
+          closePrice, roundedClosePnl, 'closed', trade.id
+        );
+      } else {
+        db.prepare('UPDATE paper_trades SET current_price = ?, pnl = ? WHERE id = ?').run(
+          curPrice, roundedPnl, trade.id
+        );
+      }
     } catch(e) { /* skip */ }
   }
 
@@ -1037,17 +1334,17 @@ async function updateAllPnL() {
   const snapInsert = db.prepare(`INSERT INTO pnl_snapshots (strategy_id, timestamp, total_pnl, open_positions, total_trades) VALUES (?, datetime('now'), ?, ?, ?)`);
 
   for (const s of strategies) {
-    const trades = db.prepare('SELECT * FROM paper_trades WHERE strategy_id = ?').all(s.id);
-    const totalPnl = trades.reduce((sum, t) => sum + (t.pnl || 0), 0);
-    const openCount = trades.filter(t => t.status === 'open').length;
-    snapInsert.run(s.id, Math.round(totalPnl * 100) / 100, openCount, trades.length);
+    const buyTrades = db.prepare("SELECT * FROM paper_trades WHERE strategy_id = ? AND side = 'BUY'").all(s.id);
+    const totalPnl = buyTrades.reduce((sum, t) => sum + (t.pnl || 0), 0);
+    const openCount = buyTrades.filter(t => t.status === 'open').length;
+    snapInsert.run(s.id, Math.round(totalPnl * 100) / 100, openCount, buyTrades.length);
   }
 
   // Combined snapshot (strategy_id = 0)
-  const allTrades = db.prepare('SELECT * FROM paper_trades').all();
-  const combinedPnl = allTrades.reduce((sum, t) => sum + (t.pnl || 0), 0);
-  const combinedOpen = allTrades.filter(t => t.status === 'open').length;
-  snapInsert.run(0, Math.round(combinedPnl * 100) / 100, combinedOpen, allTrades.length);
+  const allBuyTrades = db.prepare("SELECT * FROM paper_trades WHERE side = 'BUY'").all();
+  const combinedPnl = allBuyTrades.reduce((sum, t) => sum + (t.pnl || 0), 0);
+  const combinedOpen = allBuyTrades.filter(t => t.status === 'open').length;
+  snapInsert.run(0, Math.round(combinedPnl * 100) / 100, combinedOpen, allBuyTrades.length);
 
   console.log(`[PNL] Updated ${openTrades.length} positions, ${Object.keys(priceCache).length} unique tokens`);
 }
@@ -1138,10 +1435,18 @@ app.get('/api/stats', (req, res) => {
 
   const stats = strategies.map(s => {
     const trades = db.prepare('SELECT * FROM paper_trades WHERE strategy_id = ?').all(s.id);
-    const totalPnl = trades.reduce((sum, t) => sum + (t.pnl || 0), 0);
-    const totalNotional = trades.reduce((sum, t) => sum + (t.notional || 0), 0);
-    const openCount = trades.filter(t => t.status === 'open').length;
-    const winCount = trades.filter(t => (t.pnl || 0) > 0).length;
+    // Only count BUY trades for PnL (SELL rows have pnl=0 to avoid double-counting)
+    const buyTrades = trades.filter(t => t.side === 'BUY');
+    const totalPnl = buyTrades.reduce((sum, t) => sum + (t.pnl || 0), 0);
+    const totalNotional = buyTrades.reduce((sum, t) => sum + (t.notional || 0), 0);
+    const openCount = buyTrades.filter(t => t.status === 'open').length;
+    const closedCount = buyTrades.filter(t => t.status === 'closed').length;
+    const winCount = buyTrades.filter(t => (t.pnl || 0) > 0).length;
+    const paperBudget = s.paper_budget || 100;
+    // Budget: cash = budget - total_invested + returned_from_closed
+    const totalReturned = buyTrades.filter(t => t.status === 'closed').reduce((sum, t) => sum + (t.notional || 0) + (t.pnl || 0), 0);
+    const paperRemaining = Math.max(0, paperBudget - totalNotional + totalReturned);
+    const portfolioValue = paperBudget + totalPnl;
     return {
       strategy_id: s.id,
       strategy_name: s.name,
@@ -1150,17 +1455,21 @@ app.get('/api/stats', (req, res) => {
       target_url: s.target_url,
       flat_bet: s.flat_bet,
       active: s.active,
-      total_trades: trades.length,
+      total_trades: buyTrades.length,
       open_trades: openCount,
+      closed_trades: closedCount,
       total_pnl: Math.round(totalPnl * 100) / 100,
       total_notional: Math.round(totalNotional * 100) / 100,
-      win_rate: trades.length > 0 ? Math.round((winCount / trades.length) * 100) : 0,
-      roi: totalNotional > 0 ? Math.round((totalPnl / totalNotional) * 10000) / 100 : 0
+      win_rate: buyTrades.length > 0 ? Math.round((winCount / buyTrades.length) * 100) : 0,
+      roi: totalNotional > 0 ? Math.round((totalPnl / totalNotional) * 10000) / 100 : 0,
+      paper_budget: paperBudget,
+      paper_remaining: Math.round(paperRemaining * 100) / 100,
+      portfolio_value: Math.round(portfolioValue * 100) / 100,
     };
   });
 
-  // Combined stats
-  const allTrades = db.prepare('SELECT * FROM paper_trades').all();
+  // Combined stats (BUY trades only for accurate metrics)
+  const allTrades = db.prepare("SELECT * FROM paper_trades WHERE side = 'BUY'").all();
   const combinedPnl = allTrades.reduce((sum, t) => sum + (t.pnl || 0), 0);
   const combinedNotional = allTrades.reduce((sum, t) => sum + (t.notional || 0), 0);
   const combinedWins = allTrades.filter(t => (t.pnl || 0) > 0).length;
