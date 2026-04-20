@@ -10,12 +10,10 @@ if (process.env.PROXY_URL) {
 
   const axios = require('axios');
 
-  // Patch axios defaults
   axios.defaults.httpsAgent = httpsAgent;
   axios.defaults.httpAgent = httpAgent;
   axios.defaults.proxy = false;
 
-  // Patch axios.create so any new instance also gets the proxy
   const origCreate = axios.create.bind(axios);
   axios.create = function(config = {}) {
     config.httpsAgent = httpsAgent;
@@ -24,7 +22,6 @@ if (process.env.PROXY_URL) {
     return origCreate(config);
   };
 
-  // Patch global http/https agents for CLOB client proxy routing
   const http = require('http');
   const https = require('https');
   const _origHttpsAgent = https.globalAgent;
@@ -32,7 +29,6 @@ if (process.env.PROXY_URL) {
   http.globalAgent = httpAgent;
   https.globalAgent = httpsAgent;
 
-  // Patch global fetch: proxy for polymarket.com, direct for RPCs
   const origFetch = globalThis.fetch;
   globalThis.fetch = function(url, opts = {}) {
     if (typeof url === 'string' && url.includes('polymarket.com')) {
@@ -41,7 +37,6 @@ if (process.env.PROXY_URL) {
     return origFetch(url, opts);
   };
 
-  // Store original agents globally for getProvider() to use
   global._origHttpsAgent = _origHttpsAgent;
   global._origHttpAgent = _origHttpAgent;
 
@@ -59,27 +54,55 @@ app.use(express.static(path.join(__dirname, 'public')));
 
 const HOST = 'https://clob.polymarket.com';
 const CHAIN_ID = 137;
-const PK = process.env.POLY_PRIVATE_KEY;
 
-if (!PK) { console.error('Missing POLY_PRIVATE_KEY in .env'); process.exit(1); }
+const PK = process.env.POLY_PRIVATE_KEY;
+const FUNDER_ADDRESS = process.env.FUNDER_ADDRESS || null;
+const SIGNATURE_TYPE = Number(process.env.SIGNATURE_TYPE || 1);
+
+if (!PK) {
+  console.error('Missing POLY_PRIVATE_KEY in .env');
+  process.exit(1);
+}
 
 const wallet = new ethers.Wallet(PK);
-console.log('Wallet address:', wallet.address);
+const TRADING_ADDRESS = FUNDER_ADDRESS || wallet.address;
+
+console.log('Signer wallet:', wallet.address);
+console.log('Trading/funder address:', TRADING_ADDRESS);
+console.log('Signature type:', SIGNATURE_TYPE);
 
 // ── State ──
 let apiCreds = null;
 let clobClient = null;
 
+// ── Helper: build Polymarket client ──
+function makeClobClient(creds = null, throwOnError = false) {
+  return new ClobClient(
+    HOST,
+    CHAIN_ID,
+    wallet,
+    creds,
+    SIGNATURE_TYPE,
+    TRADING_ADDRESS,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    throwOnError
+  );
+}
+
 // ── Init: derive API creds ──
 async function initClient() {
   try {
-    const tempClient = new ClobClient(HOST, CHAIN_ID, wallet);
+    const tempClient = makeClobClient(null);
     console.log('[INIT] Deriving API credentials...');
     apiCreds = await tempClient.createOrDeriveApiKey();
     console.log('[INIT] API Key:', apiCreds.key);
     console.log('[INIT] Credentials ready');
 
-    clobClient = new ClobClient(HOST, CHAIN_ID, wallet, {
+    clobClient = makeClobClient({
       key: apiCreds.key,
       secret: apiCreds.secret,
       passphrase: apiCreds.passphrase,
@@ -89,7 +112,7 @@ async function initClient() {
     const fs = require('fs');
     const envPath = __dirname + '/.env';
     let env = fs.readFileSync(envPath, 'utf8');
-    if (!env.includes('CLOB_API_KEY')) {
+    if (!env.includes('CLOB_API_KEY=')) {
       env += `\nCLOB_API_KEY=${apiCreds.key}\nCLOB_SECRET=${apiCreds.secret}\nCLOB_PASSPHRASE=${apiCreds.passphrase}\n`;
       fs.writeFileSync(envPath, env);
       console.log('[INIT] Saved credentials to .env');
@@ -106,8 +129,12 @@ async function initClient() {
 async function loadOrDerive() {
   if (process.env.CLOB_API_KEY && process.env.CLOB_SECRET && process.env.CLOB_PASSPHRASE) {
     console.log('[INIT] Loading saved API credentials...');
-    apiCreds = { key: process.env.CLOB_API_KEY, secret: process.env.CLOB_SECRET, passphrase: process.env.CLOB_PASSPHRASE };
-    clobClient = new ClobClient(HOST, CHAIN_ID, wallet, apiCreds);
+    apiCreds = {
+      key: process.env.CLOB_API_KEY,
+      secret: process.env.CLOB_SECRET,
+      passphrase: process.env.CLOB_PASSPHRASE,
+    };
+    clobClient = makeClobClient(apiCreds);
     console.log('[INIT] Client ready with saved creds');
     return true;
   }
@@ -124,9 +151,11 @@ async function searchMarkets(query) {
 
 app.get('/api/status', (req, res) => {
   res.json({
-    wallet: wallet.address,
+    signer_wallet: wallet.address,
+    trading_wallet: TRADING_ADDRESS,
     connected: !!clobClient,
     hasCredentials: !!apiCreds,
+    signatureType: SIGNATURE_TYPE,
   });
 });
 
@@ -137,12 +166,13 @@ const RPCS = [
   'https://polygon.gateway.tenderly.co',
 ];
 const POLYGON_NETWORK = { name: 'matic', chainId: 137 };
-const USDC_BRIDGED = '0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174'; // USDC.e (Polymarket uses this)
+const USDC_BRIDGED = '0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174'; // USDC.e
 const USDC_NATIVE  = '0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359'; // Native USDC
 const CTF_EXCHANGE = '0xC5d563A36AE78145C45a50134d48A1215220f80a';
 const NEG_RISK_EXCHANGE = '0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E';
 const NEG_RISK_ADAPTER = '0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296';
-const CTF_CONTRACT = '0x4D97DCd97eC945f40cF65F87097ACe5EA0476045'; // Conditional Token Framework
+const CTF_CONTRACT = '0x4D97DCd97eC945f40cF65F87097ACe5EA0476045';
+
 const ERC20_ABI = [
   'function balanceOf(address) view returns (uint256)',
   'function allowance(address,address) view returns (uint256)',
@@ -173,7 +203,7 @@ class DirectRpcProvider extends ethers.providers.StaticJsonRpcProvider {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body,
-      agent: this._directAgent, // bypass proxy
+      agent: this._directAgent,
       signal: AbortSignal.timeout(10000),
     });
     if (!resp.ok) throw new Error(`RPC ${resp.status}`);
@@ -214,13 +244,13 @@ async function getProvider() {
   throw new Error(`No working Polygon RPC${lastError ? `: ${lastError.message}` : ''}`);
 }
 
-// Gas override for Polygon (base fee ~100+ gwei currently)
+// Gas override for Polygon
 const GAS_OVERRIDES = {
   maxPriorityFeePerGas: ethers.utils.parseUnits('40', 'gwei'),
   maxFeePerGas: ethers.utils.parseUnits('250', 'gwei'),
 };
 
-// Balance cache (refresh every 20s, serve instantly)
+// Balance cache
 let balanceCache = null;
 let balanceCacheTime = 0;
 const BALANCE_CACHE_MS = 20000;
@@ -230,21 +260,28 @@ async function refreshBalance() {
     const provider = await getProvider();
     const bridged = new ethers.Contract(USDC_BRIDGED, ERC20_ABI, provider);
     const native  = new ethers.Contract(USDC_NATIVE, ERC20_ABI, provider);
-    const [bal1, bal2, polBal, allow1, allow2, allow3] = await Promise.all([
-      bridged.balanceOf(wallet.address),
-      native.balanceOf(wallet.address),
+
+    const [bal1, bal2, signerPol, tradingPol, allow1, allow2, allow3] = await Promise.all([
+      bridged.balanceOf(TRADING_ADDRESS),
+      native.balanceOf(TRADING_ADDRESS),
       provider.getBalance(wallet.address),
-      bridged.allowance(wallet.address, CTF_EXCHANGE),
-      bridged.allowance(wallet.address, NEG_RISK_EXCHANGE),
-      bridged.allowance(wallet.address, NEG_RISK_ADAPTER),
+      provider.getBalance(TRADING_ADDRESS),
+      bridged.allowance(TRADING_ADDRESS, CTF_EXCHANGE),
+      bridged.allowance(TRADING_ADDRESS, NEG_RISK_EXCHANGE),
+      bridged.allowance(TRADING_ADDRESS, NEG_RISK_ADAPTER),
     ]);
+
     const bridgedBal = parseFloat(ethers.utils.formatUnits(bal1, 6));
     const nativeBal = parseFloat(ethers.utils.formatUnits(bal2, 6));
+
     balanceCache = {
+      signer_wallet: wallet.address,
+      trading_wallet: TRADING_ADDRESS,
       usdc_bridged: bridgedBal,
       usdc_native: nativeBal,
       usdc: bridgedBal + nativeBal,
-      pol: parseFloat(ethers.utils.formatEther(polBal)),
+      pol: parseFloat(ethers.utils.formatEther(tradingPol)),
+      pol_signer: parseFloat(ethers.utils.formatEther(signerPol)),
       allowance_ctf: ethers.utils.formatUnits(allow1, 6),
       allowance_neg_risk: ethers.utils.formatUnits(allow2, 6),
       allowance_adapter: ethers.utils.formatUnits(allow3, 6),
@@ -254,44 +291,50 @@ async function refreshBalance() {
       _cached_at: Date.now(),
     };
     balanceCacheTime = Date.now();
-  } catch(e) {
+  } catch (e) {
     providerCache = null;
     providerCacheTime = 0;
     console.error('[BALANCE] Refresh error:', e.message);
   }
 }
 
-// Start background balance refresh
 setInterval(refreshBalance, BALANCE_CACHE_MS);
-setTimeout(refreshBalance, 1000); // Initial fetch after 1s
+setTimeout(refreshBalance, 1000);
 
 app.get('/api/balance', async (req, res) => {
   try {
-    // Return cache if available
     if (balanceCache && (Date.now() - balanceCacheTime) < BALANCE_CACHE_MS * 3) {
       return res.json(balanceCache);
     }
-    // Fallback: fetch now
+
     await refreshBalance();
     if (balanceCache) return res.json(balanceCache);
+
     const provider = await getProvider();
     const bridged = new ethers.Contract(USDC_BRIDGED, ERC20_ABI, provider);
     const native  = new ethers.Contract(USDC_NATIVE, ERC20_ABI, provider);
-    const [bal1, bal2, polBal, allow1, allow2, allow3] = await Promise.all([
-      bridged.balanceOf(wallet.address),
-      native.balanceOf(wallet.address),
+
+    const [bal1, bal2, signerPol, tradingPol, allow1, allow2, allow3] = await Promise.all([
+      bridged.balanceOf(TRADING_ADDRESS),
+      native.balanceOf(TRADING_ADDRESS),
       provider.getBalance(wallet.address),
-      bridged.allowance(wallet.address, CTF_EXCHANGE),
-      bridged.allowance(wallet.address, NEG_RISK_EXCHANGE),
-      bridged.allowance(wallet.address, NEG_RISK_ADAPTER),
+      provider.getBalance(TRADING_ADDRESS),
+      bridged.allowance(TRADING_ADDRESS, CTF_EXCHANGE),
+      bridged.allowance(TRADING_ADDRESS, NEG_RISK_EXCHANGE),
+      bridged.allowance(TRADING_ADDRESS, NEG_RISK_ADAPTER),
     ]);
+
     const bridgedBal = parseFloat(ethers.utils.formatUnits(bal1, 6));
     const nativeBal = parseFloat(ethers.utils.formatUnits(bal2, 6));
+
     res.json({
+      signer_wallet: wallet.address,
+      trading_wallet: TRADING_ADDRESS,
       usdc_bridged: bridgedBal,
       usdc_native: nativeBal,
       usdc: bridgedBal + nativeBal,
-      pol: parseFloat(ethers.utils.formatEther(polBal)),
+      pol: parseFloat(ethers.utils.formatEther(tradingPol)),
+      pol_signer: parseFloat(ethers.utils.formatEther(signerPol)),
       allowance_ctf: ethers.utils.formatUnits(allow1, 6),
       allowance_neg_risk: ethers.utils.formatUnits(allow2, 6),
       allowance_adapter: ethers.utils.formatUnits(allow3, 6),
@@ -316,8 +359,18 @@ app.get('/api/clob-balance', async (req, res) => {
 });
 
 // ── Approve USDC.e for all Polymarket exchange contracts ──
+// NOTE: This only works when signer wallet controls the funded wallet.
+// If signer and funder differ, on-chain approvals from this script are not supported.
 app.post('/api/approve', async (req, res) => {
   try {
+    if (TRADING_ADDRESS.toLowerCase() !== wallet.address.toLowerCase()) {
+      return res.status(400).json({
+        error: 'Separate FUNDER_ADDRESS detected. This route can only approve tokens for the signer wallet. Use a same-wallet setup or extend with proxy-safe approval flow.',
+        signer_wallet: wallet.address,
+        trading_wallet: TRADING_ADDRESS,
+      });
+    }
+
     const provider = await getProvider();
     const signer = wallet.connect(provider);
     const usdc = new ethers.Contract(USDC_BRIDGED, ERC20_ABI, signer);
@@ -332,13 +385,12 @@ app.post('/api/approve', async (req, res) => {
         await tx.wait();
         console.log(`[APPROVE] ${name} confirmed!`);
         results.push({ name, tx: tx.hash, status: 'confirmed' });
-      } catch(e) {
+      } catch (e) {
         console.error(`[APPROVE] ${name} failed:`, e.message);
         results.push({ name, error: e.message });
       }
     }
 
-    // Also approve CTF (conditional tokens) for selling
     const ctf = new ethers.Contract(CTF_CONTRACT, CTF_ABI, signer);
     for (const [name, addr] of [['CTF Exchange', CTF_EXCHANGE], ['Neg Risk Exchange', NEG_RISK_EXCHANGE], ['Neg Risk Adapter', NEG_RISK_ADAPTER]]) {
       try {
@@ -350,14 +402,14 @@ app.post('/api/approve', async (req, res) => {
           console.log(`[APPROVE] CTF ${name} confirmed!`);
           results.push({ name: 'CTF-' + name, tx: tx.hash, status: 'confirmed' });
         }
-      } catch(e) {
+      } catch (e) {
         results.push({ name: 'CTF-' + name, error: e.message });
       }
     }
 
-    // Tell CLOB to refresh allowance
-    try { await clobClient.updateBalanceAllowance({ asset_type: 'COLLATERAL' }); } catch(e) {}
-    try { await clobClient.updateBalanceAllowance({ asset_type: 'CONDITIONAL' }); } catch(e) {}
+    try { await clobClient.updateBalanceAllowance({ asset_type: 'COLLATERAL' }); } catch (e) {}
+    try { await clobClient.updateBalanceAllowance({ asset_type: 'CONDITIONAL' }); } catch (e) {}
+
     res.json({ results });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -365,20 +417,27 @@ app.post('/api/approve', async (req, res) => {
 });
 
 // ── Swap native USDC → USDC.e via Uniswap V3 ──
+// NOTE: This only works when signer wallet controls the funded wallet.
 app.post('/api/swap-usdc', async (req, res) => {
   try {
-    const { amount } = req.body; // amount in USDC (e.g. 10)
+    if (TRADING_ADDRESS.toLowerCase() !== wallet.address.toLowerCase()) {
+      return res.status(400).json({
+        error: 'Separate FUNDER_ADDRESS detected. This route only supports swapping for the signer wallet.',
+        signer_wallet: wallet.address,
+        trading_wallet: TRADING_ADDRESS,
+      });
+    }
+
+    const { amount } = req.body;
     const provider = await getProvider();
     const signer = wallet.connect(provider);
 
-    // Uniswap V3 SwapRouter on Polygon
     const SWAP_ROUTER = '0xE592427A0AEce92De3Edee1F18E0157C05861564';
     const swapAbi = [
       'function exactInputSingle((address tokenIn, address tokenOut, uint24 fee, address recipient, uint256 deadline, uint256 amountIn, uint256 amountOutMinimum, uint160 sqrtPriceLimitX96)) external payable returns (uint256 amountOut)',
     ];
     const amountIn = ethers.utils.parseUnits(String(amount || '10'), 6);
 
-    // First approve Uniswap router to spend native USDC
     const nativeUsdc = new ethers.Contract(USDC_NATIVE, ERC20_ABI, signer);
     console.log('[SWAP] Approving native USDC for Uniswap...');
     const approveTx = await nativeUsdc.approve(SWAP_ROUTER, amountIn, GAS_OVERRIDES);
@@ -390,15 +449,15 @@ app.post('/api/swap-usdc', async (req, res) => {
     const swapTx = await router.exactInputSingle({
       tokenIn: USDC_NATIVE,
       tokenOut: USDC_BRIDGED,
-      fee: 100, // 0.01% pool (stablecoin)
+      fee: 100,
       recipient: wallet.address,
       deadline,
       amountIn,
-      amountOutMinimum: amountIn.mul(995).div(1000), // 0.5% slippage
+      amountOutMinimum: amountIn.mul(995).div(1000),
       sqrtPriceLimitX96: 0,
     }, GAS_OVERRIDES);
     console.log('[SWAP] Swap tx:', swapTx.hash);
-    const receipt = await swapTx.wait();
+    await swapTx.wait();
     console.log('[SWAP] Swap confirmed!');
     res.json({ tx: swapTx.hash, status: 'confirmed' });
   } catch (e) {
@@ -407,9 +466,18 @@ app.post('/api/swap-usdc', async (req, res) => {
   }
 });
 
-// ── Full setup: swap + approve + verify (all-in-one) ──
+// ── Full setup: swap + approve + verify ──
+// NOTE: This only works when signer wallet controls the funded wallet.
 app.post('/api/setup', async (req, res) => {
   try {
+    if (TRADING_ADDRESS.toLowerCase() !== wallet.address.toLowerCase()) {
+      return res.status(400).json({
+        error: 'Separate FUNDER_ADDRESS detected. This route only supports same-wallet setup. For proxy/funder wallets, fund the proxy and use CLOB trading with funder enabled.',
+        signer_wallet: wallet.address,
+        trading_wallet: TRADING_ADDRESS,
+      });
+    }
+
     const provider = await getProvider();
     const signer = wallet.connect(provider);
     const polBal = await provider.getBalance(wallet.address);
@@ -421,7 +489,6 @@ app.post('/api/setup', async (req, res) => {
     const bridgedBal = await bridged.balanceOf(wallet.address);
     const steps = [];
 
-    // Step 1: Swap native USDC to USDC.e if needed
     if (nativeBal.gt(0) && bridgedBal.lt(ethers.utils.parseUnits('5', 6))) {
       console.log('[SETUP] Swapping native USDC to USDC.e...');
       const SWAP_ROUTER = '0xE592427A0AEce92De3Edee1F18E0157C05861564';
@@ -441,7 +508,6 @@ app.post('/api/setup', async (req, res) => {
       console.log('[SETUP] Swap done:', swapTx.hash);
     }
 
-    // Step 2: Approve USDC.e for exchange contracts
     const maxApproval = ethers.constants.MaxUint256;
     for (const [name, addr] of [['CTF Exchange', CTF_EXCHANGE], ['Neg Risk Exchange', NEG_RISK_EXCHANGE], ['Neg Risk Adapter', NEG_RISK_ADAPTER]]) {
       const currentAllowance = await bridged.allowance(wallet.address, addr);
@@ -453,7 +519,6 @@ app.post('/api/setup', async (req, res) => {
       }
     }
 
-    // Step 2b: Approve CTF tokens for selling
     const ctf = new ethers.Contract(CTF_CONTRACT, CTF_ABI, signer);
     for (const [name, addr] of [['CTF Exchange', CTF_EXCHANGE], ['Neg Risk Exchange', NEG_RISK_EXCHANGE], ['Neg Risk Adapter', NEG_RISK_ADAPTER]]) {
       const approved = await ctf.isApprovedForAll(wallet.address, addr);
@@ -465,9 +530,8 @@ app.post('/api/setup', async (req, res) => {
       }
     }
 
-    // Step 3: Refresh CLOB balance
-    try { await clobClient.updateBalanceAllowance({ asset_type: 'COLLATERAL' }); } catch(e) {}
-    try { await clobClient.updateBalanceAllowance({ asset_type: 'CONDITIONAL' }); } catch(e) {}
+    try { await clobClient.updateBalanceAllowance({ asset_type: 'COLLATERAL' }); } catch (e) {}
+    try { await clobClient.updateBalanceAllowance({ asset_type: 'CONDITIONAL' }); } catch (e) {}
 
     const finalBal = await bridged.balanceOf(wallet.address);
     res.json({
@@ -487,7 +551,6 @@ app.get('/api/search', async (req, res) => {
     if (!q) return res.json([]);
     const markets = await searchMarkets(q);
     res.json(markets.map(m => {
-      // Build tokens array from clobTokenIds + outcomes
       const tokenIds = JSON.parse(m.clobTokenIds || '[]');
       const outcomes = JSON.parse(m.outcomes || '[]');
       const prices = JSON.parse(m.outcomePrices || '[]');
@@ -529,7 +592,7 @@ async function fetchAllPositions() {
   const positions = [];
 
   for (let offset = 0; ; ) {
-    const url = `https://data-api.polymarket.com/positions?user=${wallet.address}&limit=${limit}&offset=${offset}&sizeThreshold=${sizeThreshold}`;
+    const url = `https://data-api.polymarket.com/positions?user=${TRADING_ADDRESS}&limit=${limit}&offset=${offset}&sizeThreshold=${sizeThreshold}`;
     const r = await fetch(url);
     if (!r.ok) throw new Error(`Positions API ${r.status}`);
 
@@ -572,7 +635,7 @@ app.post('/api/buy', async (req, res) => {
     if (!tokenId || !price || !size) return res.status(400).json({ error: 'Missing tokenId, price, size' });
 
     const ot = orderType === 'FOK' ? OrderType.FOK : orderType === 'GTD' ? OrderType.GTD : OrderType.GTC;
-    console.log(`[TRADE] BUY ${size} shares @ $${price} (${ot}) token=${tokenId.slice(0,10)}...`);
+    console.log(`[TRADE] BUY ${size} shares @ $${price} (${ot}) token=${tokenId.slice(0, 10)}...`);
 
     const orderPayload = { tokenID: tokenId, price: parseFloat(price), side: Side.BUY, size: parseFloat(size) };
     if (ot === OrderType.GTD) orderPayload.expiration = Math.floor(Date.now() / 1000) + 300;
@@ -594,13 +657,74 @@ app.post('/api/buy', async (req, res) => {
 app.post('/api/market-buy', async (req, res) => {
   try {
     if (!clobClient) return res.status(503).json({ error: 'Client not initialized' });
-    const { tokenId, amount, tickSize, negRisk } = req.body;
+    const { tokenId, amount, tickSize, negRisk, maxSlippage } = req.body;
     if (!tokenId || !amount) return res.status(400).json({ error: 'Missing tokenId, amount' });
 
-    console.log(`[TRADE] MARKET BUY $${amount} token=${tokenId.slice(0,10)}...`);
+    const slippageLimit = parseFloat(maxSlippage) || 0.03;
+
+    // Slippage protection: check order book depth before placing FOK
+    try {
+      const orderbook = await clobClient.getOrderBook(tokenId);
+      const bestAsk = parseFloat(orderbook.asks?.[0]?.price || 0);
+      const bestBid = parseFloat(orderbook.bids?.[0]?.price || 0);
+      if (bestAsk > 0 && bestBid > 0) {
+        const midpoint = (bestAsk + bestBid) / 2;
+        const slippage = (bestAsk - midpoint) / midpoint;
+        if (slippage > slippageLimit) {
+          console.log(`[SLIPPAGE] BUY rejected: bestAsk=${bestAsk} mid=${midpoint.toFixed(4)} slippage=${(slippage*100).toFixed(1)}%`);
+          return res.status(400).json({ error: 'Slippage too high', bestAsk, midpoint, slippagePct: (slippage*100).toFixed(2) + '%' });
+        }
+      }
+    } catch (e) {
+      console.log('[SLIPPAGE] Order book check failed, proceeding without slippage guard:', e.message);
+    }
+
+    console.log(`[TRADE] MARKET BUY $${amount} token=${tokenId.slice(0, 10)}...`);
 
     const resp = await clobClient.createAndPostMarketOrder(
       { tokenID: tokenId, amount: parseFloat(amount), side: Side.BUY, orderType: OrderType.FOK },
+      { tickSize: tickSize || '0.01', negRisk: negRisk || false },
+      OrderType.FOK
+    );
+
+    console.log('[TRADE] Result:', JSON.stringify(resp));
+    res.json(resp);
+  } catch (e) {
+    console.error('[TRADE] Error:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/api/market-sell', async (req, res) => {
+  try {
+    if (!clobClient) return res.status(503).json({ error: 'Client not initialized' });
+    const { tokenId, amount, tickSize, negRisk, maxSlippage } = req.body;
+    // Note: 'amount' here is number of shares to sell (taker-amount)
+    if (!tokenId || !amount) return res.status(400).json({ error: 'Missing tokenId, amount' });
+
+    const slippageLimit = parseFloat(maxSlippage) || 0.03;
+
+    // Slippage protection: check order book before placing FOK sell
+    try {
+      const orderbook = await clobClient.getOrderBook(tokenId);
+      const bestAsk = parseFloat(orderbook.asks?.[0]?.price || 0);
+      const bestBid = parseFloat(orderbook.bids?.[0]?.price || 0);
+      if (bestAsk > 0 && bestBid > 0) {
+        const midpoint = (bestAsk + bestBid) / 2;
+        const slippage = (midpoint - bestBid) / midpoint;
+        if (slippage > slippageLimit) {
+          console.log(`[SLIPPAGE] SELL rejected: bestBid=${bestBid} mid=${midpoint.toFixed(4)} slippage=${(slippage*100).toFixed(1)}%`);
+          return res.status(400).json({ error: 'Slippage too high', bestBid, midpoint, slippagePct: (slippage*100).toFixed(2) + '%' });
+        }
+      }
+    } catch (e) {
+      console.log('[SLIPPAGE] Order book check failed, proceeding without slippage guard:', e.message);
+    }
+
+    console.log(`[TRADE] MARKET SELL ${amount} shares token=${tokenId.slice(0, 10)}...`);
+
+    const resp = await clobClient.createAndPostMarketOrder(
+      { tokenID: tokenId, amount: parseFloat(amount), side: Side.SELL, orderType: OrderType.FOK },
       { tickSize: tickSize || '0.01', negRisk: negRisk || false },
       OrderType.FOK
     );
@@ -622,7 +746,7 @@ app.post('/api/sell', async (req, res) => {
       return res.json({ skipped: true, reason: 'dust position' });
     }
 
-    console.log(`[TRADE] SELL ${size} shares @ $${price} token=${tokenId.slice(0,10)}...`);
+    console.log(`[TRADE] SELL ${size} shares @ $${price} token=${tokenId.slice(0, 10)}...`);
 
     const resp = await clobClient.createAndPostOrder(
       { tokenID: tokenId, price: parseFloat(price), side: Side.SELL, size: parseFloat(size) },
@@ -655,8 +779,17 @@ app.post('/api/cancel', async (req, res) => {
 });
 
 // ── Redeem resolved positions ──
+// NOTE: This only works when signer wallet controls the funded wallet.
 app.post('/api/redeem', async (req, res) => {
   try {
+    if (TRADING_ADDRESS.toLowerCase() !== wallet.address.toLowerCase()) {
+      return res.status(400).json({
+        error: 'Separate FUNDER_ADDRESS detected. This route only supports same-wallet redeem flow.',
+        signer_wallet: wallet.address,
+        trading_wallet: TRADING_ADDRESS,
+      });
+    }
+
     const { conditionId, negRisk } = req.body;
     if (!conditionId) return res.status(400).json({ error: 'conditionId required' });
 
@@ -665,12 +798,10 @@ app.post('/api/redeem', async (req, res) => {
 
     let tx;
     if (negRisk) {
-      // Neg-risk markets use the NegRiskAdapter
       const adapter = new ethers.Contract(NEG_RISK_ADAPTER, NEG_RISK_ADAPTER_ABI, signer);
       console.log(`[REDEEM] Neg-risk redeem for ${conditionId}...`);
       tx = await adapter.redeemPositions(conditionId, [1, 2], GAS_OVERRIDES);
     } else {
-      // Regular markets use CTF directly
       const ctf = new ethers.Contract(CTF_CONTRACT, CTF_ABI, signer);
       const parentCollectionId = ethers.constants.HashZero;
       console.log(`[REDEEM] Standard redeem for ${conditionId}...`);
@@ -681,7 +812,6 @@ app.post('/api/redeem', async (req, res) => {
     const receipt = await tx.wait();
     console.log(`[REDEEM] Confirmed! Gas used: ${receipt.gasUsed.toString()}`);
 
-    // Refresh balance cache
     providerCache = null;
     providerCacheTime = 0;
     balanceCacheTime = 0;
@@ -696,10 +826,18 @@ app.post('/api/redeem', async (req, res) => {
 });
 
 // ── Redeem all resolved positions at once ──
+// NOTE: This only works when signer wallet controls the funded wallet.
 app.post('/api/redeem-all', async (req, res) => {
   try {
+    if (TRADING_ADDRESS.toLowerCase() !== wallet.address.toLowerCase()) {
+      return res.status(400).json({
+        error: 'Separate FUNDER_ADDRESS detected. This route only supports same-wallet redeem flow.',
+        signer_wallet: wallet.address,
+        trading_wallet: TRADING_ADDRESS,
+      });
+    }
+
     const { positions } = req.body;
-    // positions = [{ conditionId, negRisk, name }]
     if (!positions || !positions.length) return res.status(400).json({ error: 'positions array required' });
 
     const provider = await getProvider();
@@ -719,7 +857,7 @@ app.post('/api/redeem-all', async (req, res) => {
           tx = await ctf.redeemPositions(USDC_BRIDGED, ethers.constants.HashZero, pos.conditionId, [1, 2], GAS_OVERRIDES);
         }
         console.log(`[REDEEM] tx: ${tx.hash}`);
-        const receipt = await tx.wait();
+        await tx.wait();
         console.log(`[REDEEM] ${pos.name || pos.conditionId} confirmed!`);
         results.push({ name: pos.name, conditionId: pos.conditionId, tx: tx.hash, status: 'confirmed' });
       } catch (e) {
@@ -730,7 +868,6 @@ app.post('/api/redeem-all', async (req, res) => {
       }
     }
 
-    // Refresh balance cache
     providerCache = null;
     providerCacheTime = 0;
     balanceCacheTime = 0;
@@ -745,7 +882,7 @@ app.post('/api/redeem-all', async (req, res) => {
 // ── Start ──
 (async () => {
   await loadOrDerive();
-  app.listen(4001, '0.0.0.0', () => {
-    console.log('\n  PM Trading Test running on port 4001\n  http://localhost:4001\n');
+  app.listen(4002, '0.0.0.0', () => {
+    console.log('\n  PM Trading Test running on port 4002\n  http://localhost:4002\n');
   });
 })();

@@ -5,10 +5,17 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "dev": "node server.js"
+    "dev": "node server.js",
+    "orchestrator": "node orchestrator/bot.js",
+    "agent": "node orchestrator/agent.js",
+    "arb": "node orchestrator/arb-scanner.js",
+    "theta": "node orchestrator/theta.js"
   },
   "dependencies": {
-    "express": "^4.18.2",
-    "better-sqlite3": "^11.0.0"
+    "@polymarket/clob-client": "^5.8.1",
+    "better-sqlite3": "^11.0.0",
+    "dotenv": "^17.4.2",
+    "ethers": "^5.8.0",
+    "express": "^4.18.2"
   }
 }

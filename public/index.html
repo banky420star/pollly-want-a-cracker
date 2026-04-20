@@ -194,9 +194,24 @@ tr:hover { background: rgba(255,255,255,.02); }
         <h3>P&L by Trader</h3>
         <div class="chart-wrap"><canvas id="breakdown-chart"></canvas></div>
       </div>
+    <div class="charts-row" style="margin-top: 20px;">
+      <div class="chart-card" style="height:auto;">
+        <h3 style="display:flex;justify-content:space-between;align-items:center;">
+          Algo Scoring (72h)
+          <span style="font-size:10px;background:rgba(255,255,255,.05);padding:3px 8px;border-radius:10px;">AUTO-PAUSE EXPOSED</span>
+        </h3>
+        <div id="scores-list" style="display:flex; flex-direction:column; gap:8px; margin-top:10px;"></div>
+      </div>
+      <div class="chart-card" style="height:auto;">
+        <h3 style="display:flex;justify-content:space-between;align-items:center;">
+          Market Category P&L
+          <span style="font-size:10px;background:rgba(0,212,170,.1);color:var(--green);padding:3px 8px;border-radius:10px;">ALL CATEGORIES ACTIVE</span>
+        </h3>
+        <div id="categories-list" style="display:flex; flex-direction:column; gap:8px; margin-top:10px;"></div>
+      </div>
     </div>
 
-    <div class="portfolios" id="portfolios"></div>
+    <div class="portfolios" id="portfolios" style="margin-top: 20px;"></div>
 
     <div class="trades-section">
       <div class="section-head">
@@ -315,7 +330,50 @@ async function init() {
 }
 
 async function refresh() {
-  await Promise.all([loadStats(), loadTrades(), loadPnlChart()]);
+  await Promise.all([loadStats(), loadTrades(), loadPnlChart(), loadSystemHealth()]);
+}
+
+// ── System Health (Scores & Categories) ──
+async function loadSystemHealth() {
+  try {
+    const [scores, categories] = await Promise.all([
+      api('GET', '/scores'),
+      api('GET', '/category-stats')
+    ]);
+
+    // Render Trader Scores
+    const sl = document.getElementById('scores-list');
+    if (sl) {
+      sl.innerHTML = scores.map(s => {
+        const color = s.score === 1 ? 'var(--green)' : 'var(--red)';
+        const bg = s.score === 1 ? 'rgba(0,212,170,.1)' : 'rgba(255,71,87,.1)';
+        const btn = s.score === 1 ? 'ACTIVE' : 'AUTO-PAUSED';
+        return `<div style="display:flex;justify-content:space-between;align-items:center;padding:8px 12px;background:var(--card2);border-radius:6px;border-left:3px solid ${color}">
+          <div>
+            <div style="font-weight:600;font-size:13px;">${esc(s.target_name)} ${!s.active ? '<span style="color:var(--dim)">(disabled manually)</span>' : ''}</div>
+            <div style="font-size:11px;color:var(--dim);margin-top:2px;">Win Rate: ${s.winRate}% · PNL: €${s.totalPnl} (${s.trades} trades)</div>
+          </div>
+          <div style="font-size:10px;font-weight:700;color:${color};background:${bg};padding:3px 8px;border-radius:4px;">${btn}</div>
+        </div>`;
+      }).join('');
+    }
+
+    // Render Category Stats
+    const cl = document.getElementById('categories-list');
+    if (cl) {
+      cl.innerHTML = categories.map(c => {
+        const pnlCls = c.pnl >= 0 ? 'pos' : 'neg';
+        const PnlSign = c.pnl >= 0 ? '+' : '';
+        return `<div style="display:flex;justify-content:space-between;align-items:center;padding:8px 12px;background:var(--card2);border-radius:6px;">
+          <div>
+            <div style="font-weight:600;font-size:13px;">${esc(c.category)}</div>
+            <div style="font-size:11px;color:var(--dim);margin-top:2px;">Win Rate: ${c.win_rate}% · Trades: ${c.trades}</div>
+          </div>
+          <div class="${pnlCls}" style="font-weight:700;font-size:13px;">${PnlSign}€${c.pnl}</div>
+        </div>`;
+      }).join('');
+    }
+  } catch(e) { }
 }
 
 // ── Navigation ──

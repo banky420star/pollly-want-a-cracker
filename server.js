@@ -300,7 +300,7 @@ async function getMarketMeta(conditionId) {
 // LIVE TRADING ENGINE
 // ============================================================
 
-const TRADING_SERVER = 'http://127.0.0.1:4001';
+const TRADING_SERVER = 'http://127.0.0.1:4002';
 const AUTO_COLLECT_PRICE = 0.99;
 const AUTO_COLLECT_COOLDOWN_MS = 5000;
 const STALE_POSITION_HOURS = 2; // sell positions older than this
@@ -311,18 +311,62 @@ const REDEEM_SUCCESS_COOLDOWN_MS = 6 * 60 * 60 * 1000;
 const REDEEM_ERROR_COOLDOWN_MS = 10 * 60 * 1000;
 const REDEEM_ATTEMPT_COOLDOWN_MS = 2 * 60 * 1000;
 
-// Paper trading realism settings
 const TRADE_FEE_RATE = 0.01;       // 1% fee per trade (entry + exit = ~2% roundtrip)
 const SLIPPAGE_PCT = 0.01;          // 1% slippage due to 5s polling delay
-const AUTO_CLOSE_HARD = 0.98;       // hard close: market effectively resolved
-const AUTO_CLOSE_SOFT = 0.90;       // soft close: near-resolved, not much upside left
-const AUTO_CLOSE_SOFT_HOLD_MIN = 15; // minutes to hold before soft-closing
+const GLOBAL_MAX_BET = 10.00;       // hard cap: never bet more than $10 per trade
 const LIVE_STATE_CACHE_MS = 5000;
 const MAX_LIVE_TRADE_AGE_SECONDS = 90;
 const RETRY_COOLDOWN_MS = 15000;
 const STALE_ORDER_MINUTES = 10;
 const ORDER_CLEANUP_COOLDOWN_MS = 30000;
 
+
+
+const SCORE_LOOKBACK_HOURS = 72;    // score on last 72h of trades
+const LOSER_WIN_RATE = 30.0;        // traders below 30% win rate are 'losers'
+const LOSER_MAX_TRADES_PER_HOUR = 1; // losers limited to 1 trade per hour
+
+function getTraderScore(strategyId) {
+  const lookback = new Date(Date.now() - SCORE_LOOKBACK_HOURS * 3600000).toISOString();
+  const closed = db.prepare(`
+    SELECT pnl FROM paper_trades
+    WHERE strategy_id = ? AND side = 'BUY' AND status = 'closed'
+    AND timestamp > ?
+  `).all(strategyId, lookback);
+
+  if (closed.length === 0) return { score: 1, reason: 'no trades', trades: 0 };
+
+  const wins = closed.filter(t => (t.pnl || 0) > 0).length;
+  const winRate = wins / closed.length;
+  const totalPnl = closed.reduce((sum, t) => sum + (t.pnl || 0), 0);
+  const avgPnl = totalPnl / closed.length;
+
+  // Compute Sharpe-like ratio from individual trade PnLs
+  const mean = avgPnl;
+  const variance = closed.reduce((sum, t) => sum + Math.pow((t.pnl || 0) - mean, 2), 0) / closed.length;
+  const stdDev = Math.sqrt(variance) || 0.01;
+  const sharpe = mean / stdDev;
+
+  // Normalize components to 0-1 range
+  const normalizedSharpe = Math.min(Math.max(sharpe / 3, 0), 1); // sharpe of 3+ is excellent
+  const normalizedWinRate = Math.min(Math.max(winRate, 0), 1); // 0-1 already
+  const kellyEdge = Math.min(Math.max(avgPnl / (stdDev || 1), 0), 1); // edge/variability
+
+  // Composite score: 40% sharpe + 30% win rate + 30% kelly edge
+  const score = (0.4 * normalizedSharpe) + (0.3 * normalizedWinRate) + (0.3 * kellyEdge);
+
+  return {
+    score: Math.round(score * 1000) / 1000,
+    winRate: Math.round(winRate * 1000) / 10,
+    totalPnl: Math.round(totalPnl * 100) / 100,
+    avgPnl: Math.round(avgPnl * 1000) / 1000,
+    sharpe: Math.round(sharpe * 100) / 100,
+    trades: closed.length,
+    reason: 'ok',
+  };
+}
+
+// Removed Stop-Loss logic based on user preference to ride volatility
 
 let liveStateCache = null;
 let liveStateCacheTime = 0;
@@ -791,6 +835,105 @@ async function maybeAutoCollectPositions(reason = 'auto', force = false) {
   }
 }
 
+// ============================================================
+// CAPITAL RECYCLING - Sell positions to free up capital for new trades
+// ============================================================
+
+async function recycleCapitalForTrade(requiredAmount) {
+  console.log(`[RECYCLE] Need $${requiredAmount.toFixed(2)} to place new trade`);
+  
+  const state = await getLiveState(true);
+  if (!state.positions || state.positions.length === 0) {
+    console.log('[RECYCLE] No positions to recycle');
+    return false;
+  }
+
+  const sellablePositions = state.positions
+    .filter(p => {
+      const size = getPositionSize(p);
+      const value = getPositionCurrentValue(p);
+      return size > 0 && value >= MIN_COLLECT_VALUE;
+    })
+    .map(p => {
+      const tokenId = String(p.asset);
+      const oldest = db.prepare(
+        "SELECT MIN(timestamp) as oldest FROM live_trades WHERE token_id = ? AND status = 'filled' AND side = 'BUY'"
+      ).get(tokenId);
+      const ageMs = oldest?.oldest ? Date.now() - new Date(oldest.oldest).getTime() : 0;
+      const ageHours = ageMs / (1000 * 60 * 60);
+      
+      return {
+        ...p,
+        ageHours,
+        currentValue: getPositionCurrentValue(p),
+        size: getPositionSize(p),
+        price: getPositionPrice(p),
+      };
+    })
+    .sort((a, b) => {
+      if (Math.abs(a.ageHours - b.ageHours) > 1) {
+        return b.ageHours - a.ageHours;
+      }
+      return a.currentValue - b.currentValue;
+    });
+
+  if (sellablePositions.length === 0) {
+    console.log('[RECYCLE] No sellable positions found');
+    return false;
+  }
+
+  let totalFreed = 0;
+  for (const pos of sellablePositions) {
+    if (totalFreed >= requiredAmount) break;
+    
+    const currentBalance = await getTradingBalance(true);
+    const freeBalance = toNumber(currentBalance.usdc_bridged ?? currentBalance.usdc);
+    
+    const potentialValue = pos.currentValue;
+    const estimatedFreeAfter = freeBalance + potentialValue;
+    
+    if (estimatedFreeAfter < requiredAmount && pos !== sellablePositions[sellablePositions.length - 1]) {
+      continue;
+    }
+
+    console.log(`[RECYCLE] Attempting to sell: ${pos.title || pos.outcome} (${pos.size} shares, $${pos.currentValue.toFixed(2)}, ${pos.ageHours.toFixed(1)}h old)`);
+    
+    try {
+      const sellPrice = Math.max(0.01, Math.floor(pos.price * 100) / 100);
+      const sellResponse = await tradingFetchJson('/api/sell', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          tokenId: pos.asset,
+          price: sellPrice,
+          size: pos.size,
+          negRisk: !!pos.negativeRisk,
+        }),
+      });
+      
+      if (sellResponse.orderID || sellResponse.tx) {
+        totalFreed += pos.currentValue;
+        console.log(`[RECYCLE] SOLD: ${pos.title || pos.outcome} @ $${sellPrice} for $${pos.currentValue.toFixed(2)} (freed: $${totalFreed.toFixed(2)})`);
+        invalidateLiveState();
+        
+        await new Promise(r => setTimeout(r, 500));
+      } else {
+        console.log(`[RECYCLE] Failed to sell ${pos.title}: ${sellResponse.error || 'unknown error'}`);
+      }
+    } catch (e) {
+      console.log(`[RECYCLE] Error selling ${pos.title}: ${e.message}`);
+    }
+  }
+
+  if (totalFreed >= requiredAmount) {
+    console.log(`[RECYCLE] SUCCESS: Freed $${totalFreed.toFixed(2)} (needed $${requiredAmount.toFixed(2)})`);
+    return true;
+  } else {
+    console.log(`[RECYCLE] PARTIAL: Freed $${totalFreed.toFixed(2)} (needed $${requiredAmount.toFixed(2)})`);
+    return totalFreed > 0;
+  }
+}
+
 async function cleanupStaleBuyOrders(reason = 'cleanup', force = false) {
   const now = Date.now();
   if (!force && (now - lastOrderCleanupAt) < ORDER_CLEANUP_COOLDOWN_MS) {
@@ -856,6 +999,7 @@ async function checkSafetyLimits(force = false) {
   const configuredCap = parseFloat(getConfig.get('max_loss')?.value || '0');
   const effectiveCap = configuredCap > 0 ? configuredCap : portfolioValue;
 
+  // Max exposure cap
   if (configuredCap > 0 && state.totalExposure > effectiveCap) {
     return {
       ok: false,
@@ -866,6 +1010,35 @@ async function checkSafetyLimits(force = false) {
       collectable_positions: state.collectableCount,
       free_balance: Math.round(freeBalance * 10000) / 10000,
     };
+  }
+
+  // Portfolio-level drawdown protection
+  const peakBalance = parseFloat(getConfig.get('peak_balance')?.value || '0');
+  if (peakBalance > 0) {
+    const drawdown = (peakBalance - portfolioValue) / peakBalance;
+    if (drawdown >= 0.30) {
+      return { ok: false, reason: `EMERGENCY: ${(drawdown*100).toFixed(1)}% drawdown from peak $${peakBalance}` };
+    }
+    if (drawdown >= 0.20) {
+      return { ok: false, reason: `HALT: ${(drawdown*100).toFixed(1)}% drawdown from peak $${peakBalance}` };
+    }
+  }
+  // Track peak balance
+  if (portfolioValue > peakBalance) {
+    db.prepare(`INSERT OR REPLACE INTO live_config (key, value) VALUES ('peak_balance', ?)`).run(portfolioValue.toFixed(2));
+  }
+
+  // Max position concentration: no single market > 15% of bankroll
+  const positions = state.positions || [];
+  const concentrationMap = new Map();
+  for (const pos of positions) {
+    const condId = pos.conditionId || pos.asset;
+    concentrationMap.set(condId, (concentrationMap.get(condId) || 0) + Math.abs(pos.value || pos.size * pos.avg_price || 0));
+  }
+  for (const [condId, exposure] of concentrationMap) {
+    if (portfolioValue > 0 && exposure / portfolioValue > 0.15) {
+      return { ok: false, reason: `Concentration limit: market ${condId?.slice(0,10)}... is ${(exposure/portfolioValue*100).toFixed(1)}% of portfolio (max 15%)` };
+    }
   }
 
   return {
@@ -901,8 +1074,22 @@ async function executeLiveTrade(strategy, target, trade, paperTradeId) {
   }
 
   const side = (trade.side || '').toUpperCase();
-  const tokenId = trade.asset || '';
-  const conditionId = trade.conditionId || '';
+  const tokenId = trade.asset || trade.token_id;
+  const conditionId = trade.conditionId || trade.condition_id;
+
+  // ── Loser Limiter: throttle poor performers ──
+  if (side === 'BUY') {
+    const score = getTraderScore(strategy.id);
+    if (score.trades >= 10 && score.winRate < LOSER_WIN_RATE) {
+      const hourAgo = new Date(Date.now() - 3600000).toISOString();
+      const recentTrades = db.prepare("SELECT COUNT(*) as count FROM live_trades WHERE strategy_id = ? AND side = 'BUY' AND timestamp > ?").get(strategy.id, hourAgo).count;
+      if (recentTrades >= LOSER_MAX_TRADES_PER_HOUR) {
+        console.log(`[LIMIT] ${strategy.name} throttled: ${score.winRate}% win rate (loser)`);
+        return;
+      }
+    }
+  }
+
   if (!tokenId) {
     console.log('[LIVE] Skip: no token ID');
     return;
@@ -925,27 +1112,52 @@ async function executeLiveTrade(strategy, target, trade, paperTradeId) {
   const clampedPrice = Math.min(Math.max(price, tick), maxPrice);
   const roundedPrice = parseFloat(clampedPrice.toFixed(tick < 0.01 ? 3 : 2));
 
+  // Proactive Capital Recycling - check balance before trade and recycle if needed
   let safety = await checkSafetyLimits();
-  if (!safety.ok && safety.collectable_positions > 0) {
-    await maybeAutoCollectPositions('budget-pressure');
-    safety = await checkSafetyLimits(true);
+  
+  // Calculate bet amount first (needed for balance check)
+  const targetTradeValue = parseFloat(trade.size || 0) * targetPrice;
+  let desiredBudget = Math.max(toNumber(strategy.live_bet), 1.00);
+  if (strategy.target_bankroll > 0 && strategy.live_start_capital > 0) {
+    const proportion = targetTradeValue / strategy.target_bankroll;
+    const maxBetPerc = strategy.live_start_capital * 0.1;
+    const maxTrade = Math.min(maxBetPerc, GLOBAL_MAX_BET);
+    desiredBudget = Math.max(Math.min(strategy.live_start_capital * proportion, maxTrade), 1.00);
   }
-  if (!safety.ok) {
-    await cleanupStaleBuyOrders('budget-pressure');
-    safety = await checkSafetyLimits(true);
-  }
-
-  // Use market orders (FOK) — min $1, no share minimum unlike limit orders (min 5 shares)
-  const desiredBudget = Math.max(toNumber(strategy.live_bet), 1.00); // FOK min is $1
   const betAmount = parseFloat(desiredBudget.toFixed(4));
 
-  // Skip if we already have a position on this token
-  const existingBuy = db.prepare(
-    "SELECT id FROM live_trades WHERE token_id = ? AND status = 'filled' AND side = 'BUY' LIMIT 1"
-  ).get(tokenId);
-  if (existingBuy) {
-    console.log(`[LIVE] SKIP: already have position on ${trade.outcome} | ${trade.title}`);
-    return;
+  // If not OK OR free balance is less than needed for trade, try to recycle capital
+  if (!safety.ok || toNumber(safety.free_balance) < betAmount) {
+    console.log(`[LIVE] Budget pressure: freeing up capital for new mirror...`);
+    
+    // First try auto-collection of collectable positions
+    if (safety.collectable_positions > 0) {
+      await maybeAutoCollectPositions('budget-pressure', true);
+    }
+    
+    // Then try recycling by selling oldest/stagnant positions if still needed
+    safety = await checkSafetyLimits(true);
+    if (!safety.ok || toNumber(safety.free_balance) < betAmount) {
+      await recycleCapitalForTrade(betAmount);
+      safety = await checkSafetyLimits(true);
+    }
+    
+    // Last resort: cancel stale orders
+    if (!safety.ok) {
+      await cleanupStaleBuyOrders('budget-pressure', true);
+      safety = await checkSafetyLimits(true);
+    }
+  }
+
+  // Skip if we already have a position on this token (BUY side only)
+  if (side === 'BUY') {
+    const existingBuy = db.prepare(
+      "SELECT id FROM live_trades WHERE token_id = ? AND status = 'filled' AND side = 'BUY' LIMIT 1"
+    ).get(tokenId);
+    if (existingBuy) {
+      console.log(`[LIVE] SKIP: already have position on ${trade.outcome} | ${trade.title}`);
+      return;
+    }
   }
 
   if (!safety.ok) {
@@ -996,9 +1208,28 @@ async function executeLiveTrade(strategy, target, trade, paperTradeId) {
       });
       resp = await r.json();
     } else {
-      db.prepare("UPDATE live_trades SET status = 'skipped', error = 'Sells not implemented' WHERE id = ?").run(liveTradeId);
-      console.log(`[LIVE] SKIP SELL: ${trade.title}`);
-      return;
+      // ── LIVE SELL: Exit entire position ──
+      const state = await getLiveState(true);
+      const pos = state.positions.find(p => String(p.asset) === String(tokenId));
+      
+      if (!pos || getPositionSize(pos) <= 0) {
+        db.prepare("UPDATE live_trades SET status = 'skipped', error = 'No live position to sell' WHERE id = ?").run(liveTradeId);
+        console.log(`[LIVE] SKIP SELL: No position for ${trade.title}`);
+        return;
+      }
+
+      const shares = getPositionSize(pos);
+      const r = await fetch(`${TRADING_SERVER}/api/market-sell`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          tokenId,
+          amount: shares,
+          tickSize: meta.tickSize,
+          negRisk: meta.negRisk,
+        }),
+      });
+      resp = await r.json();
     }
 
     if (resp.error) {
@@ -1012,8 +1243,13 @@ async function executeLiveTrade(strategy, target, trade, paperTradeId) {
       const orderId = resp.orderID || resp.order_id || JSON.stringify(resp).slice(0, 200);
       db.prepare("UPDATE live_trades SET status = 'filled', order_id = ? WHERE id = ?").run(orderId, liveTradeId);
       invalidateLiveState();
-      const shares = resp.takingAmount ? parseFloat(resp.takingAmount).toFixed(1) : '?';
-      console.log(`[LIVE] FILLED: ${side} ${shares} shares for $${betAmount.toFixed(2)} "${trade.outcome}" | ${trade.title}`);
+      
+      if (side === 'BUY') {
+        const shares = resp.takingAmount ? parseFloat(resp.takingAmount).toFixed(1) : '?';
+        console.log(`[LIVE] FILLED: BUY ${shares} shares for $${betAmount.toFixed(2)} "${trade.outcome}" | ${trade.title}`);
+      } else {
+        console.log(`[LIVE] FILLED: SELL ${getPositionSize(pos)} shares (Mirror Exit) "${trade.outcome}" | ${trade.title}`);
+      }
     }
   } catch(e) {
     db.prepare("UPDATE live_trades SET status = 'error', error = ? WHERE id = ?").run(e.message, liveTradeId);
@@ -1053,11 +1289,14 @@ async function pollAllTargets() {
   }
 
   const targets = db.prepare('SELECT * FROM targets WHERE active = 1').all();
-  for (const target of targets) {
-    try {
-      await pollTarget(target);
-    } catch (err) {
-      console.error(`[POLL] Error for ${target.name}: ${err.message}`);
+
+  // Poll all targets in parallel for faster detection
+  const results = await Promise.allSettled(
+    targets.map(target => pollTarget(target))
+  );
+  for (const r of results) {
+    if (r.status === 'rejected') {
+      console.error(`[POLL] Error: ${r.reason?.message || r.reason}`);
     }
   }
 }
@@ -1112,6 +1351,21 @@ async function processPaperTrade(strategy, target, trade) {
   const targetPrice = parseFloat(trade.price) || 0;
   if (targetSize === 0 || targetPrice === 0) return;
 
+  // ── Loser Limiter: throttle poor performers ──
+  if (side === 'BUY') {
+    const score = getTraderScore(strategy.id);
+    if (score.trades >= 10 && score.winRate < LOSER_WIN_RATE) {
+      const hourAgo = new Date(Date.now() - 3600000).toISOString().replace('T', ' ').slice(0, 19);
+      const recentTrades = db.prepare("SELECT COUNT(*) as count FROM paper_trades WHERE strategy_id = ? AND side = 'BUY' AND timestamp > ?").get(strategy.id, hourAgo).count;
+      if (recentTrades >= LOSER_MAX_TRADES_PER_HOUR) {
+        console.log(`[LIMIT-PAPER] ${strategy.name} throttled: ${score.winRate}% win rate (loser)`);
+        return;
+      }
+    }
+  }
+
+
+
   // Check for duplicate (same target tx)
   const txHash = trade.transactionHash || '';
   if (txHash) {
@@ -1156,13 +1410,30 @@ async function processPaperTrade(strategy, target, trade) {
     );
 
     console.log(`[PAPER] ${strategy.name} | SELL "${trade.outcome || ''}" @ $${sellPrice.toFixed(3)} (slip from $${targetPrice.toFixed(3)}) | PnL: $${pnl.toFixed(2)} (fees: $${(entryFee+exitFee).toFixed(3)}) | ${trade.title || ''}`);
+    
+    // Mirror the SELL live
+    try {
+      await executeLiveTrade(strategy, target, trade, openBuy.id);
+    } catch(e) {
+      console.error(`[LIVE] Error in mirror sell: ${e.message}`);
+    }
     return;
   }
 
   // === BUY ===
   // Apply slippage: we buy after target, price slightly worse (higher)
   const entryPrice = Math.min(targetPrice * (1 + SLIPPAGE_PCT), 0.99);
-  const notional = strategy.flat_bet;
+
+  // Proportional trade sizing
+  let notional = strategy.flat_bet;
+  const targetTradeValue = targetSize * targetPrice;
+  if (strategy.target_bankroll > 0 && strategy.paper_budget > 0) {
+    const proportion = targetTradeValue / strategy.target_bankroll;
+    const maxBetPerc = strategy.paper_budget * 0.1; // Cap at 10% of paper budget
+    const maxTrade = Math.min(maxBetPerc, GLOBAL_MAX_BET);
+    notional = Math.max(Math.min(strategy.paper_budget * proportion, maxTrade), 1.00);
+  }
+
   const size = Math.round((notional / entryPrice) * 100) / 100;
 
   // Don't buy if already holding this token (no duplicate positions)
@@ -1307,25 +1578,11 @@ async function updateAllPnL() {
       // Determine if we should auto-close this trade
       const tradeAgeMs = Date.now() - new Date(trade.timestamp).getTime();
       const tradeAgeMin = tradeAgeMs / 60000;
-      const shouldHardClose = curPrice >= AUTO_CLOSE_HARD || curPrice <= (1 - AUTO_CLOSE_HARD);
-      const shouldSoftClose = (curPrice >= AUTO_CLOSE_SOFT || curPrice <= (1 - AUTO_CLOSE_SOFT))
-        && tradeAgeMin >= AUTO_CLOSE_SOFT_HOLD_MIN;
 
-      if (shouldHardClose || shouldSoftClose) {
-        // Apply exit slippage for soft-close (selling at market, slight slippage)
-        const closePrice = shouldHardClose ? curPrice : curPrice * (curPrice >= AUTO_CLOSE_SOFT ? (1 - SLIPPAGE_PCT) : (1 + SLIPPAGE_PCT));
-        const closePnl = trade.side === 'BUY'
-          ? (closePrice - trade.price) * trade.size - entryFee - (closePrice * trade.size * TRADE_FEE_RATE)
-          : (trade.price - closePrice) * trade.size - entryFee - (closePrice * trade.size * TRADE_FEE_RATE);
-        const roundedClosePnl = Math.round(closePnl * 100) / 100;
-        db.prepare('UPDATE paper_trades SET current_price = ?, pnl = ?, status = ? WHERE id = ?').run(
-          closePrice, roundedClosePnl, 'closed', trade.id
-        );
-      } else {
-        db.prepare('UPDATE paper_trades SET current_price = ?, pnl = ? WHERE id = ?').run(
-          curPrice, roundedPnl, trade.id
-        );
-      }
+
+      db.prepare('UPDATE paper_trades SET current_price = ?, pnl = ? WHERE id = ?').run(
+        curPrice, roundedPnl, trade.id
+      );
     } catch(e) { /* skip */ }
   }
 
@@ -1416,6 +1673,7 @@ app.get('/api/trades', (req, res) => {
     FROM paper_trades pt
     JOIN strategies s ON pt.strategy_id = s.id
     JOIN targets t ON pt.target_id = t.id
+    WHERE s.active = 1
   `;
   const conditions = [];
   const params = [];
@@ -1518,6 +1776,57 @@ app.post('/api/polling/start', (req, res) => { startPolling(); res.json({ status
 app.post('/api/polling/stop', (req, res) => { stopPolling(); res.json({ status: 'stopped' }); });
 app.get('/api/polling/status', (req, res) => { res.json({ running: !!pollingInterval }); });
 
+// ── Trader Scores API ──
+app.get('/api/scores', (req, res) => {
+  const strategies = db.prepare(`
+    SELECT s.id, s.name, s.active, s.live_enabled, t.name as target_name, t.address
+    FROM strategies s JOIN targets t ON t.id = s.target_id
+    WHERE s.active = 1
+  `).all();
+
+  const scores = strategies.map(s => ({
+    ...s,
+    ...getTraderScore(s.id),
+  }));
+
+  res.json(scores);
+});
+
+// ── Category Performance API ──
+app.get('/api/category-stats', (req, res) => {
+  const closed = db.prepare(`
+    SELECT pt.title, pt.pnl FROM paper_trades pt
+    JOIN strategies s ON pt.strategy_id = s.id
+    WHERE pt.side = 'BUY' AND pt.status = 'closed' AND s.active = 1
+  `).all();
+
+  const categories = {};
+  for (const t of closed) {
+    let cat = 'Other';
+    if (/O\/U \d/i.test(t.title) || /over.*under/i.test(t.title)) cat = 'Over/Under';
+    else if (/win/i.test(t.title)) cat = 'Win Markets';
+    else if (/draw/i.test(t.title)) cat = 'Draw';
+    else if (/both teams to score|BTTS/i.test(t.title)) cat = 'BTTS';
+    else if (/counter.*strike|dota|league|esport/i.test(t.title)) cat = 'Esports';
+
+    if (!categories[cat]) categories[cat] = { trades: 0, wins: 0, pnl: 0, blocked: false };
+    categories[cat].trades++;
+    if ((t.pnl || 0) > 0) categories[cat].wins++;
+    categories[cat].pnl += t.pnl || 0;
+  }
+
+  const result = Object.entries(categories).map(([name, data]) => ({
+    category: name,
+    trades: data.trades,
+    wins: data.wins,
+    win_rate: data.trades > 0 ? Math.round(data.wins / data.trades * 1000) / 10 : 0,
+    pnl: Math.round(data.pnl * 100) / 100,
+    blocked: data.blocked,
+  })).sort((a, b) => b.pnl - a.pnl);
+
+  res.json(result);
+});
+
 // ============================================================
 // LIVE TRADING API
 // ============================================================
@@ -1535,6 +1844,7 @@ app.get('/api/live/config', async (req, res) => {
     const strategies = db.prepare(`
       SELECT s.id, s.name, s.target_id, s.live_enabled, s.live_bet, s.live_budget, s.live_start_capital, t.name as target_name
       FROM strategies s JOIN targets t ON s.target_id = t.id
+      WHERE s.live_enabled = 1
     `).all();
     // Add budget usage per strategy
     for (const s of strategies) {
@@ -1613,8 +1923,12 @@ app.get('/api/live/trades', (req, res) => {
   const params = [];
   if (status) { conditions.push('status = ?'); params.push(status); }
   if (stratId) { conditions.push('strategy_id = ?'); params.push(stratId); }
-  let sql = 'SELECT * FROM live_trades';
-  if (conditions.length) sql += ' WHERE ' + conditions.join(' AND ');
+  let sql = `
+    SELECT lt.* FROM live_trades lt
+    JOIN strategies s ON lt.strategy_id = s.id
+    WHERE s.live_enabled = 1
+  `;
+  if (conditions.length) sql += ' AND ' + conditions.join(' AND ');
   sql += ' ORDER BY timestamp DESC LIMIT ?';
   params.push(parseInt(limit) || 100);
   res.json(db.prepare(sql).all(...params));
@@ -1709,11 +2023,22 @@ app.get('/api/live/balance', async (req, res) => {
 app.get('/api/live/positions', async (req, res) => {
   try {
     const stratId = resolveStrategyFilter(req.query);
-    const tokenFilter = stratId ? getStrategyTokenIds(stratId) : null;
+    let tokenFilter = null;
+    if (stratId) {
+      tokenFilter = getStrategyTokenIds(stratId);
+    } else {
+      // Show only tokens from ALL active live strategies
+      const activeIds = db.prepare("SELECT id FROM strategies WHERE live_enabled = 1").all().map(r => r.id);
+      tokenFilter = new Set();
+      for (const id of activeIds) {
+        const tids = getStrategyTokenIds(id);
+        for (const tid of tids) tokenFilter.add(tid);
+      }
+    }
 
     const positions = (await getTradingPositions())
       .filter(position => getPositionSize(position) > 0)
-      .filter(position => !tokenFilter || tokenFilter.has(String(position.asset)))
+      .filter(position => tokenFilter.has(String(position.asset)))
       .sort((a, b) => getPositionCurrentValue(b) - getPositionCurrentValue(a))
       .map(position => {
         const currentPrice = getPositionPrice(position);
@@ -1896,7 +2221,7 @@ app.get('/api/live/position-history', (req, res) => {
 // START
 // ============================================================
 
-const PORT = process.env.PORT || 4000;
+const PORT = process.env.PORT || 4003;
 app.listen(PORT, () => {
   console.log(`\n  Polymarket CopyTrader running on port ${PORT}`);
   console.log(`  http://localhost:${PORT}\n`);
