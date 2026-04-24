@@ -4,6 +4,7 @@ const express = require('express');
 const { ProfitOrchestrator } = require('./profit-agent');
 const { fetchMarketNews } = require('./news-fetcher');
 const { getPerformanceStats, getBetHistory, getWinningPatterns } = require('./memory');
+const { MarketMaker, MIN_MM_BANKROLL } = require('./market-maker');
 
 const app = express();
 app.use(express.json());
@@ -11,6 +12,8 @@ app.use(express.json());
 let orchestrator = null;
 let tradingServerUrl = null;
 let agentModule = null;
+let marketMaker = null;
+let mmActiveMarkets = new Set(); // track which markets MM is quoting
 
 async function searchMarkets(query) {
   const res = await fetch(`https://gamma-api.polymarket.com/markets?closed=false&limit=10&title_contains=${encodeURIComponent(query)}`);
@@ -218,7 +221,7 @@ app.get('/api/orchestrator/progress', (req, res) => {
   }
 });
 
-const PORT = process.env.ORCHESTRATOR_PORT || 4003;
+const PORT = process.env.ORCHESTRATOR_PORT || 4004;
 
 app.post('/api/orchestrator/agent/start', async (req, res) => {
   try {
@@ -305,6 +308,173 @@ orchestrator = new ProfitOrchestrator({
 
 tradingServerUrl = process.env.TRADING_SERVER_URL || 'http://127.0.0.1:4002';
 console.log('[ORCHESTRATOR] Configured:', { minConfidence: orchestrator.minConfidence, maxBet: orchestrator.maxBet });
+
+// ── Market Maker activation check ──
+// If bankroll >= $10,000, enable market making on top 5 markets by volume.
+// Runs every 60 seconds to check balance and adjust quotes.
+
+const MM_CHECK_INTERVAL_MS = 60000;
+const MM_TOP_MARKETS = 5;
+
+const MM_SEARCH_QUERIES = ['Bitcoin', 'Ethereum', 'Trump', 'election', 'Fed rate', 'AI', 'crypto', 'stock market'];
+
+async function getMmBankroll() {
+  try {
+    const res = await fetch(`${tradingServerUrl}/api/clob-balance`, { signal: AbortSignal.timeout(5000) });
+    if (!res.ok) throw new Error(`clob-balance returned ${res.status}`);
+    const data = await res.json();
+    return parseFloat(data.usdc_bridged || data.USDC || data.balance || 0);
+  } catch (e) {
+    console.error('[MM] Failed to fetch balance:', e.message);
+    return 0;
+  }
+}
+
+async function fetchTopMarketsByVolume(count) {
+  const allMarkets = [];
+  for (const query of MM_SEARCH_QUERIES) {
+    try {
+      const res = await fetch(`https://gamma-api.polymarket.com/markets?closed=false&limit=20&title_contains=${encodeURIComponent(query)}`);
+      const markets = await res.json();
+      for (const m of markets) {
+        const tokenIds = JSON.parse(m.clobTokenIds || '[]');
+        const outcomes = JSON.parse(m.outcomes || '[]');
+        const prices = JSON.parse(m.outcomePrices || '[]');
+        if (tokenIds.length === 0 || m.closed) continue;
+
+        const tokens = tokenIds.map((id, i) => ({
+          tokenId: id,
+          outcome: outcomes[i],
+          price: parseFloat(prices[i] || 0)
+        })).filter(t => t.price > 0);
+
+        allMarkets.push({
+          conditionId: m.conditionId,
+          question: m.question,
+          tokens,
+          volume: parseFloat(m.volume || 0),
+          negRisk: m.negRisk || false
+        });
+      }
+    } catch (e) {
+      // skip failed queries
+    }
+  }
+
+  // Deduplicate by conditionId and sort by volume descending
+  const seen = new Set();
+  const unique = [];
+  for (const m of allMarkets) {
+    if (seen.has(m.conditionId)) continue;
+    seen.add(m.conditionId);
+    unique.push(m);
+  }
+  unique.sort((a, b) => b.volume - a.volume);
+  return unique.slice(0, count);
+}
+
+async function checkMarketMakerActivation() {
+  const bankroll = await getMmBankroll();
+
+  if (!marketMaker) {
+    marketMaker = new MarketMaker(tradingServerUrl);
+  }
+
+  if (bankroll >= MIN_MM_BANKROLL) {
+    if (!marketMaker.enabled) {
+      marketMaker.enabled = true;
+      console.log(`[MM] ENABLING market making — bankroll $${bankroll.toFixed(2)} >= $${MIN_MM_BANKROLL}`);
+    }
+
+    // Fetch top markets by volume and place quotes
+    const topMarkets = await fetchTopMarketsByVolume(MM_TOP_MARKETS);
+    const newMarketKeys = new Set(topMarkets.map(m => m.conditionId));
+
+    // Cancel quotes on markets that dropped out of top 5
+    for (const existingKey of mmActiveMarkets) {
+      if (!newMarketKeys.has(existingKey)) {
+        const existingMarket = marketMaker.activeMarkets.has(existingKey);
+        if (existingMarket) {
+          await marketMaker.cancelQuotes(existingKey);
+          console.log(`[MM] Cancelled quotes on dropped market: ${existingKey.slice(0, 10)}...`);
+        }
+      }
+    }
+
+    // Place quotes on top markets
+    let quotedCount = 0;
+    for (const market of topMarkets) {
+      for (const token of market.tokens) {
+        if (token.price < 0.10 || token.price > 0.90) continue; // skip near-certain markets
+
+        const result = await marketMaker.quoteMarket(
+          token.tokenId,
+          token.price,
+          0.4, // sigma estimate
+          bankroll,
+          market.negRisk
+        );
+
+        if (result) {
+          quotedCount++;
+        }
+      }
+      mmActiveMarkets.add(market.conditionId);
+    }
+
+    if (quotedCount > 0) {
+      console.log(`[MM] Placed ${quotedCount} quotes across ${topMarkets.length} top markets (bankroll: $${bankroll.toFixed(2)})`);
+    }
+  } else {
+    // Bankroll below threshold — disable if currently active
+    if (marketMaker.enabled) {
+      console.log(`[MM] DISABLING market making — bankroll $${bankroll.toFixed(2)} < $${MIN_MM_BANKROLL}`);
+      // Cancel all active quotes
+      for (const key of mmActiveMarkets) {
+        await marketMaker.cancelQuotes(key);
+      }
+      mmActiveMarkets.clear();
+      marketMaker.enabled = false;
+    }
+  }
+}
+
+// Start market maker check loop
+setInterval(checkMarketMakerActivation, MM_CHECK_INTERVAL_MS);
+// Initial check after 10s (give trading server time to start)
+setTimeout(checkMarketMakerActivation, 10000);
+console.log(`[MM] Market maker check scheduled every ${MM_CHECK_INTERVAL_MS / 1000}s (min bankroll: $${MIN_MM_BANKROLL})`);
+
+// ── Market Maker API endpoints ──
+
+app.get('/api/mm/status', (req, res) => {
+  res.json({
+    enabled: marketMaker?.enabled || false,
+    activeMarkets: mmActiveMarkets.size,
+    minBankroll: MIN_MM_BANKROLL,
+    activeMarketKeys: Array.from(mmActiveMarkets)
+  });
+});
+
+app.post('/api/mm/enable', (req, res) => {
+  if (!marketMaker) {
+    marketMaker = new MarketMaker(tradingServerUrl);
+  }
+  marketMaker.enabled = true;
+  res.json({ status: 'enabled', note: 'Will activate on next check cycle if bankroll sufficient' });
+});
+
+app.post('/api/mm/disable', async (req, res) => {
+  if (marketMaker) {
+    marketMaker.enabled = false;
+    // Cancel all active quotes
+    for (const key of mmActiveMarkets) {
+      await marketMaker.cancelQuotes(key);
+    }
+    mmActiveMarkets.clear();
+  }
+  res.json({ status: 'disabled' });
+});
 
 if (process.env.ORCHESTRATOR_AUTO_START_AGENT === 'true') {
   (async () => {

@@ -134,7 +134,7 @@ class ProfitOrchestrator {
     // Use proper Kelly criterion — bankroll must be provided externally
     const bankroll = this.bankroll || this.maxBet * 20; // fallback
     const size = kellyBetSize(confidence, price, bankroll);
-    if (size <= 0) return this.minBet; // minimum bet if edge is marginal
+    if (size <= 0) return 0; // NO EDGE — do not bet at all
     return Math.max(Math.min(size, this.maxBet), this.minBet);
   }
 

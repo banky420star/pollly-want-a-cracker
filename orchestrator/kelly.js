@@ -26,10 +26,13 @@ const FEE_RATE = 0.02; // ~2% round-trip fee on Polymarket
  * @returns {number} Fraction of bankroll to bet (0 if no edge)
  */
 function kellyFraction(pEdge, marketPrice, opts = {}) {
+  // Guard against NaN/undefined/Infinity inputs -- they must return 0, never NaN
+  if (!Number.isFinite(pEdge) || !Number.isFinite(marketPrice)) return 0;
+
   const fraction = opts.fraction || DEFAULT_KELLY_FRACTION;
   const feeRate = opts.feeRate !== undefined ? opts.feeRate : FEE_RATE;
 
-  if (marketPrice <= 0 || marketPrice >= 1) return 0;
+  if (marketPrice <= 0 || marketPrice >= (1 - feeRate)) return 0; // no profitable payoff after fees
   if (pEdge <= 0 || pEdge >= 1) return 0;
 
   // Adjust edge for fees: your net payoff on a win is (1 - marketPrice - feeRate)
@@ -64,6 +67,9 @@ function kellyFraction(pEdge, marketPrice, opts = {}) {
  * @returns {number} Dollar amount to bet (0 if no edge)
  */
 function kellyBetSize(pEdge, marketPrice, bankroll, opts = {}) {
+  // Guard against non-finite inputs
+  if (!Number.isFinite(bankroll) || bankroll <= 0) return 0;
+
   const frac = kellyFraction(pEdge, marketPrice, opts);
   const size = frac * bankroll;
 
@@ -95,6 +101,8 @@ function kellyBetSizeNO(qEdge, marketPriceYes, bankroll, opts = {}) {
  * @returns {Array} Array of dollar amounts, scaled to fit budget
  */
 function kellyPortfolio(bets, bankroll, opts = {}) {
+  if (!Number.isFinite(bankroll) || bankroll <= 0) return bets.map(() => 0);
+
   const maxTotalExposure = opts.maxTotalExposure || 0.40; // max 40% of bankroll deployed
 
   const sizes = bets.map(b => kellyBetSize(b.pEdge, b.marketPrice, bankroll, opts));

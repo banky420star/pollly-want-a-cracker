@@ -1,6 +1,8 @@
 const express = require('express');
 const path = require('path');
 const Database = require('better-sqlite3');
+const { detectWhaleClusters } = require('./orchestrator/whale-signals');
+const { kellyBetSize, kellyBetSizeNO } = require('./orchestrator/kelly');
 
 const app = express();
 app.use(express.json());
@@ -217,20 +219,7 @@ if (rn1Target) {
   }
 }
 
-const geniusTarget = db.prepare("SELECT id FROM targets WHERE name = 'geniusMC'").get();
-if (geniusTarget) {
-  const geniusStrat = db.prepare("SELECT id FROM strategies WHERE target_id = ?").get(geniusTarget.id);
-  if (geniusStrat) {
-    const current = db.prepare("SELECT live_budget, live_start_capital FROM strategies WHERE id = ?").get(geniusStrat.id);
-    if (!current.live_budget || current.live_budget === 0) {
-      db.prepare("UPDATE strategies SET live_enabled = 1, live_bet = 0.01, live_budget = 15, live_start_capital = 15 WHERE id = ?").run(geniusStrat.id);
-      console.log('[LIVE] geniusMC: $15 budget assigned');
-    } else {
-      db.prepare("UPDATE strategies SET live_enabled = 1, live_bet = 0.01 WHERE id = ?").run(geniusStrat.id);
-    }
-    console.log(`[LIVE] geniusMC live trading enabled`);
-  }
-}
+// geniusMC live trading disabled — only copying RN1
 
 // ============================================================
 // POLYMARKET API HELPERS
@@ -313,7 +302,7 @@ const REDEEM_ATTEMPT_COOLDOWN_MS = 2 * 60 * 1000;
 
 const TRADE_FEE_RATE = 0.01;       // 1% fee per trade (entry + exit = ~2% roundtrip)
 const SLIPPAGE_PCT = 0.01;          // 1% slippage due to 5s polling delay
-const GLOBAL_MAX_BET = 10.00;       // hard cap: never bet more than $10 per trade
+const GLOBAL_MAX_BET = 25.00;       // hard cap: max $25 per trade (Kelly-scaled)
 const LIVE_STATE_CACHE_MS = 5000;
 const MAX_LIVE_TRADE_AGE_SECONDS = 90;
 const RETRY_COOLDOWN_MS = 15000;
@@ -1033,7 +1022,8 @@ async function checkSafetyLimits(force = false) {
   const concentrationMap = new Map();
   for (const pos of positions) {
     const condId = pos.conditionId || pos.asset;
-    concentrationMap.set(condId, (concentrationMap.get(condId) || 0) + Math.abs(pos.value || pos.size * pos.avg_price || 0));
+    const posValue = getPositionCurrentValue(pos) || getPositionInitialValue(pos);
+    concentrationMap.set(condId, (concentrationMap.get(condId) || 0) + Math.abs(posValue));
   }
   for (const [condId, exposure] of concentrationMap) {
     if (portfolioValue > 0 && exposure / portfolioValue > 0.15) {
@@ -1113,39 +1103,93 @@ async function executeLiveTrade(strategy, target, trade, paperTradeId) {
   const roundedPrice = parseFloat(clampedPrice.toFixed(tick < 0.01 ? 3 : 2));
 
   // Proactive Capital Recycling - check balance before trade and recycle if needed
-  let safety = await checkSafetyLimits();
-  
-  // Calculate bet amount first (needed for balance check)
-  const targetTradeValue = parseFloat(trade.size || 0) * targetPrice;
-  let desiredBudget = Math.max(toNumber(strategy.live_bet), 1.00);
-  if (strategy.target_bankroll > 0 && strategy.live_start_capital > 0) {
-    const proportion = targetTradeValue / strategy.target_bankroll;
-    const maxBetPerc = strategy.live_start_capital * 0.1;
-    const maxTrade = Math.min(maxBetPerc, GLOBAL_MAX_BET);
-    desiredBudget = Math.max(Math.min(strategy.live_start_capital * proportion, maxTrade), 1.00);
+  let safety;
+  try {
+    safety = await checkSafetyLimits();
+  } catch (e) {
+    console.error(`[LIVE] Safety check failed (trading server unreachable?): ${e.message}`);
+    db.prepare(`
+      INSERT INTO live_trades (strategy_id, target_id, paper_trade_id, token_id, condition_id, title, outcome, side, amount, price, status, error)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'error', ?)
+    `).run(
+      strategy.id,
+      target.id,
+      paperTradeId || 0,
+      tokenId,
+      conditionId,
+      trade.title || '',
+      trade.outcome || '',
+      side,
+      0,
+      roundedPrice,
+      `Safety check failed: ${e.message}`
+    );
+    return;
   }
+
+  // Kelly Criterion bet sizing: use target's win rate as edge estimate
+  const targetTradeValue = parseFloat(trade.size || 0) * targetPrice;
+  const bankroll = toNumber(safety.free_balance) > 0 ? toNumber(safety.free_balance) : toNumber(strategy.live_start_capital);
+  const score = getTraderScore(strategy.id);
+  // Use target's win rate as Kelly edge (pEdge), market price as the other input
+  const pEdge = score.winRate > 0 ? score.winRate / 100 : 0.55; // default 55% if no history
+  let kellySize;
+  if (side === 'SELL' || side === 'NO') {
+    kellySize = kellyBetSizeNO(pEdge, roundedPrice, bankroll);
+  } else {
+    kellySize = kellyBetSize(pEdge, roundedPrice, bankroll);
+  }
+  // Fall back to proportional sizing if Kelly says 0 (no edge detected)
+  let desiredBudget;
+  if (kellySize > 0) {
+    desiredBudget = kellySize;
+    console.log(`[KELLY] ${strategy.name}: edge=${(pEdge * 100).toFixed(1)}% price=${roundedPrice} bankroll=$${bankroll.toFixed(2)} → $${kellySize.toFixed(2)}`);
+  } else {
+    desiredBudget = Math.max(toNumber(strategy.live_bet), 1.00);
+    if (strategy.target_bankroll > 0 && strategy.live_start_capital > 0) {
+      const proportion = targetTradeValue / strategy.target_bankroll;
+      const maxBetPerc = strategy.live_start_capital * 0.1;
+      const maxTrade = Math.min(maxBetPerc, GLOBAL_MAX_BET);
+      desiredBudget = Math.max(Math.min(strategy.live_start_capital * proportion, maxTrade), 1.00);
+    }
+    console.log(`[KELLY] ${strategy.name}: no Kelly edge, falling back to proportional → $${desiredBudget.toFixed(2)}`);
+  }
+  // Hard cap
+  desiredBudget = Math.min(desiredBudget, GLOBAL_MAX_BET);
   const betAmount = parseFloat(desiredBudget.toFixed(4));
 
   // If not OK OR free balance is less than needed for trade, try to recycle capital
   if (!safety.ok || toNumber(safety.free_balance) < betAmount) {
     console.log(`[LIVE] Budget pressure: freeing up capital for new mirror...`);
-    
+
     // First try auto-collection of collectable positions
-    if (safety.collectable_positions > 0) {
-      await maybeAutoCollectPositions('budget-pressure', true);
+    try {
+      if (safety.collectable_positions > 0) {
+        await maybeAutoCollectPositions('budget-pressure', true);
+      }
+    } catch (e) {
+      console.error(`[LIVE] Auto-collect failed: ${e.message}`);
     }
-    
+
     // Then try recycling by selling oldest/stagnant positions if still needed
-    safety = await checkSafetyLimits(true);
-    if (!safety.ok || toNumber(safety.free_balance) < betAmount) {
-      await recycleCapitalForTrade(betAmount);
+    try {
       safety = await checkSafetyLimits(true);
+      if (!safety.ok || toNumber(safety.free_balance) < betAmount) {
+        await recycleCapitalForTrade(betAmount);
+        safety = await checkSafetyLimits(true);
+      }
+    } catch (e) {
+      console.error(`[LIVE] Recycling check failed: ${e.message}`);
     }
-    
+
     // Last resort: cancel stale orders
-    if (!safety.ok) {
-      await cleanupStaleBuyOrders('budget-pressure', true);
-      safety = await checkSafetyLimits(true);
+    try {
+      if (!safety.ok) {
+        await cleanupStaleBuyOrders('budget-pressure', true);
+        safety = await checkSafetyLimits(true);
+      }
+    } catch (e) {
+      console.error(`[LIVE] Order cleanup failed: ${e.message}`);
     }
   }
 
@@ -1290,39 +1334,105 @@ async function pollAllTargets() {
 
   const targets = db.prepare('SELECT * FROM targets WHERE active = 1').all();
 
-  // Poll all targets in parallel for faster detection
-  const results = await Promise.allSettled(
-    targets.map(target => pollTarget(target))
+  // Collect all activities across targets for whale cluster detection
+  const allActivities = [];
+
+  // Poll all targets and collect fresh trades
+  const pollResults = await Promise.allSettled(
+    targets.map(async (target) => {
+      const { freshTrades, strategies } = await pollTargetForWhaleData(target);
+      return { target, freshTrades, strategies };
+    })
   );
-  for (const r of results) {
+
+  // Aggregate all fresh trades into activity format for whale detection
+  for (const r of pollResults) {
     if (r.status === 'rejected') {
       console.error(`[POLL] Error: ${r.reason?.message || r.reason}`);
+      continue;
+    }
+    const { target, freshTrades } = r.value;
+    for (const trade of freshTrades) {
+      allActivities.push({
+        tokenId: trade.asset || trade.token_id,
+        conditionId: trade.conditionId || trade.condition_id,
+        side: (trade.side || '').toUpperCase() === 'BUY' ? 'BUY' : 'SELL',
+        size: parseFloat(trade.size) || 0,
+        price: parseFloat(trade.price) || 0,
+        traderAddress: target.address,
+        timestamp: trade.timestamp ? parseInt(trade.timestamp) * 1000 : Date.now()
+      });
+    }
+  }
+
+  // ── Whale cluster detection ──
+  // Run detectWhaleClusters on all recent activity across targets
+  let whaleClusters = [];
+  if (allActivities.length >= 3) {
+    try {
+      whaleClusters = detectWhaleClusters(allActivities, 30); // 30-minute window
+      if (whaleClusters.length > 0) {
+        console.log(`[WHALE] ${whaleClusters.length} whale cluster(s) detected: ${whaleClusters.map(c => `${c.direction} (${c.traderCount} traders, $${c.totalVolume.toFixed(0)})`).join(', ')}`);
+      }
+    } catch (e) {
+      console.error(`[WHALE] Cluster detection error: ${e.message}`);
+    }
+  }
+
+  // Build a map of marketKey -> whale cluster boost for quick lookup
+  const whaleBoostMap = new Map();
+  for (const cluster of whaleClusters) {
+    // Boost: STRONG cluster (3-4 traders) = 1.15x, VERY_STRONG (5+) = 1.25x
+    const boost = cluster.strength === 'VERY_STRONG' ? 1.25 : 1.15;
+    whaleBoostMap.set(cluster.marketKey, { direction: cluster.direction, boost });
+  }
+
+  // Now process trades with whale boost information
+  for (const r of pollResults) {
+    if (r.status === 'rejected') continue;
+    const { target, freshTrades, strategies } = r.value;
+    if (!freshTrades || freshTrades.length === 0 || !strategies) continue;
+
+    for (const trade of freshTrades) {
+      for (const strat of strategies) {
+        // Determine whale boost for this trade
+        const tradeKey = trade.asset || trade.token_id || trade.conditionId || trade.condition_id;
+        const whaleInfo = whaleBoostMap.get(tradeKey);
+        let whaleBoost = 1.0;
+        if (whaleInfo) {
+          const tradeSide = (trade.side || '').toUpperCase();
+          // Only boost if the trade aligns with the whale cluster direction
+          if (tradeSide === whaleInfo.direction) {
+            whaleBoost = whaleInfo.boost;
+          }
+        }
+        await processPaperTrade(strat, target, trade, whaleBoost);
+      }
     }
   }
 }
 
-async function pollTarget(target) {
+// Helper: poll a target and return fresh trades + strategies (without processing them yet)
+async function pollTargetForWhaleData(target) {
   const state = db.prepare('SELECT * FROM poll_state WHERE target_id = ?').get(target.id);
   const lastTs = state?.last_trade_ts || null;
 
   const activities = await getTargetTrades(target.address, lastTs);
   if (!activities || !Array.isArray(activities) || activities.length === 0) {
     db.prepare(`INSERT OR REPLACE INTO poll_state (target_id, last_poll) VALUES (?, datetime('now'))`).run(target.id);
-    return;
+    return { target, freshTrades: [], strategies: [] };
   }
 
-  // Timestamps from PM API are unix seconds (integers)
   const parsedLast = lastTs ? parseInt(lastTs) : 0;
-
-  // Filter new trades only (timestamp is unix seconds int)
   const newTrades = parsedLast > 0
     ? activities.filter(a => parseInt(a.timestamp) > parsedLast)
-    : []; // first run: set baseline, don't copy old trades
+    : [];
   const freshTrades = newTrades.filter(trade => isTradeFresh(trade));
   const staleTrades = newTrades.length - freshTrades.length;
 
-  // Always update last seen timestamp to newest
-  const newestTs = Math.max(...activities.map(a => parseInt(a.timestamp) || 0));
+  const newestTs = activities.length > 0
+    ? Math.max(...activities.map(a => parseInt(a.timestamp) || 0))
+    : 0;
   db.prepare(`INSERT OR REPLACE INTO poll_state (target_id, last_trade_ts, last_poll) VALUES (?, ?, datetime('now'))`).run(
     target.id, String(newestTs)
   );
@@ -1331,18 +1441,14 @@ async function pollTarget(target) {
     console.log(`[POLL] ${target.name}: ${newTrades.length} new trades found${staleTrades ? `, ${staleTrades} stale` : ''}!`);
   }
 
-  if (freshTrades.length === 0) return;
+  const strategies = freshTrades.length > 0
+    ? db.prepare('SELECT * FROM strategies WHERE target_id = ? AND active = 1').all(target.id)
+    : [];
 
-  const strategies = db.prepare('SELECT * FROM strategies WHERE target_id = ? AND active = 1').all(target.id);
-
-  for (const trade of freshTrades) {
-    for (const strat of strategies) {
-      await processPaperTrade(strat, target, trade);
-    }
-  }
+  return { target, freshTrades, strategies };
 }
 
-async function processPaperTrade(strategy, target, trade) {
+async function processPaperTrade(strategy, target, trade, whaleBoost = 1.0) {
   const side = (trade.side || '').toUpperCase();
   if (side === 'BUY' && !strategy.copy_buys) return;
   if (side === 'SELL' && !strategy.copy_sells) return;
@@ -1424,14 +1530,30 @@ async function processPaperTrade(strategy, target, trade) {
   // Apply slippage: we buy after target, price slightly worse (higher)
   const entryPrice = Math.min(targetPrice * (1 + SLIPPAGE_PCT), 0.99);
 
-  // Proportional trade sizing
-  let notional = strategy.flat_bet;
-  const targetTradeValue = targetSize * targetPrice;
-  if (strategy.target_bankroll > 0 && strategy.paper_budget > 0) {
-    const proportion = targetTradeValue / strategy.target_bankroll;
-    const maxBetPerc = strategy.paper_budget * 0.1; // Cap at 10% of paper budget
-    const maxTrade = Math.min(maxBetPerc, GLOBAL_MAX_BET);
-    notional = Math.max(Math.min(strategy.paper_budget * proportion, maxTrade), 1.00);
+  // Kelly Criterion sizing for paper trades
+  const paperBankroll = strategy.paper_budget || 100000;
+  const paperScore = getTraderScore(strategy.id);
+  const paperEdge = paperScore.winRate > 0 ? paperScore.winRate / 100 : 0.55;
+  let kellyPaperSize = kellyBetSize(paperEdge, entryPrice, paperBankroll);
+  let notional;
+  if (kellyPaperSize > 0) {
+    notional = kellyPaperSize;
+  } else {
+    // Fallback to proportional
+    notional = strategy.flat_bet;
+    const targetTradeValue = targetSize * targetPrice;
+    if (strategy.target_bankroll > 0 && strategy.paper_budget > 0) {
+      const proportion = targetTradeValue / strategy.target_bankroll;
+      const maxBetPerc = strategy.paper_budget * 0.1;
+      const maxTrade = Math.min(maxBetPerc, GLOBAL_MAX_BET);
+      notional = Math.max(Math.min(strategy.paper_budget * proportion, maxTrade), 1.00);
+    }
+  }
+
+  // Apply whale cluster boost: increase bet size when whale consensus aligns
+  if (whaleBoost > 1.0) {
+    notional = Math.min(notional * whaleBoost, GLOBAL_MAX_BET);
+    console.log(`[WHALE] Boosting ${trade.outcome || 'trade'} by ${whaleBoost}x (${(whaleBoost - 1).toFixed(0)}% increase) — whale cluster detected`);
   }
 
   const size = Math.round((notional / entryPrice) * 100) / 100;
@@ -1622,6 +1744,7 @@ app.get('/api/targets', (req, res) => {
 app.post('/api/targets', (req, res) => {
   const { name, address, profile_url } = req.body;
   if (!name || !address) return res.status(400).json({ error: 'name and address required' });
+  if (!/^0x[0-9a-f]{40}$/i.test(address)) return res.status(400).json({ error: 'address must be a valid 0x-prefixed Ethereum address' });
   try {
     const info = db.prepare('INSERT INTO targets (name, address, profile_url) VALUES (?, ?, ?)').run(name, address.toLowerCase(), profile_url || '');
     res.json({ id: info.lastInsertRowid });
@@ -1762,12 +1885,16 @@ app.get('/api/pnl-history', (req, res) => {
 
 // Proxy to Polymarket
 app.get('/api/pm/positions/:address', async (req, res) => {
-  try { res.json(await getTargetPositions(req.params.address)); }
+  const address = req.params.address;
+  if (!/^0x[0-9a-f]{40}$/i.test(address)) return res.status(400).json({ error: 'Invalid address' });
+  try { res.json(await getTargetPositions(address)); }
   catch(e) { res.status(500).json({ error: e.message }); }
 });
 
 app.get('/api/pm/trades/:address', async (req, res) => {
-  try { res.json(await getTargetTrades(req.params.address)); }
+  const address = req.params.address;
+  if (!/^0x[0-9a-f]{40}$/i.test(address)) return res.status(400).json({ error: 'Invalid address' });
+  try { res.json(await getTargetTrades(address)); }
   catch(e) { res.status(500).json({ error: e.message }); }
 });
 

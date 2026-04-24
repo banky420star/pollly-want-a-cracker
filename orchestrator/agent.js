@@ -6,10 +6,12 @@ require('dotenv').config();
 const { fetchMarketNews, fetchRelevantNews } = require('./news-fetcher');
 const { kellyBetSize, kellyFraction, MAX_BET_PCT } = require('./kelly');
 const memory = require('./memory');
-const { 
-  recordBet, 
-  resolveBet, 
-  getPerformanceStats, 
+const { scanArbitrage, scanSumToOneArb } = require('./arb-scanner');
+const { scanThetaOpportunities, detectTemporalInconsistency } = require('./theta');
+const {
+  recordBet,
+  resolveBet,
+  getPerformanceStats,
   getWinningPatterns,
   updatePattern,
   recordMarketResolved,
@@ -66,12 +68,12 @@ async function searchMarkets(query) {
   try {
     const res = await fetch(`https://gamma-api.polymarket.com/markets?closed=false&limit=20&title_contains=${encodeURIComponent(query)}`);
     const markets = await res.json();
-    
+
     return markets.map(m => {
       const tokenIds = JSON.parse(m.clobTokenIds || '[]');
       const outcomes = JSON.parse(m.outcomes || '[]');
       const prices = JSON.parse(m.outcomePrices || '[]');
-      
+
       return {
         conditionId: m.conditionId,
         question: m.question,
@@ -121,7 +123,7 @@ function checkPatterns(title, outcomes) {
   let bonus = 0;
   let matchedPattern = null;
   let predictedOutcome = null;
-  
+
   for (const p of patterns) {
     if (p.sample_count >= 2 && p.success_rate > 0.5) {
       const keywords = p.pattern.toLowerCase().split(' ').filter(w => w.length > 2);
@@ -134,7 +136,7 @@ function checkPatterns(title, outcomes) {
       }
     }
   }
-  
+
   return { bonus, matchedPattern, predictedOutcome };
 }
 
@@ -163,8 +165,12 @@ async function getTradingBalance() {
 async function getPositions() {
   try {
     const res = await fetch(`${TRADING_SERVER}/api/positions`);
-    return await res.json();
-  } catch {
+    if (!res.ok) throw new Error(`positions API returned ${res.status}`);
+    const data = await res.json();
+    if (!Array.isArray(data)) throw new Error('positions API returned non-array');
+    return data;
+  } catch (e) {
+    console.error('[POSITIONS] Failed to fetch:', e.message);
     return [];
   }
 }
@@ -172,8 +178,12 @@ async function getPositions() {
 async function getOrders() {
   try {
     const res = await fetch(`${TRADING_SERVER}/api/orders`);
-    return await res.json();
-  } catch {
+    if (!res.ok) throw new Error(`orders API returned ${res.status}`);
+    const data = await res.json();
+    if (!Array.isArray(data)) throw new Error('orders API returned non-array');
+    return data;
+  } catch (e) {
+    console.error('[ORDERS] Failed to fetch:', e.message);
     return [];
   }
 }
@@ -182,16 +192,16 @@ function calculateBetSize(confidence, price, balance) {
   // Use proper Kelly criterion for binary prediction markets
   const size = kellyBetSize(confidence, price, balance);
   if (size <= 0) return 0; // No edge, don't bet
-  // Polymarket minimum is $1
-  return Math.max(size, 1.0);
+  // Polymarket minimum is $1; only bet if Kelly says >= $1
+  return size >= 1.0 ? size : 0;
 }
 
-async function executeTrade(tokenId, amount, side, price, negRisk = false) {
+async function executeTrade(tokenId, amount, side, price, negRisk = false, conditionId = null, outcome = null) {
   try {
     if (process.env.PAPER_TRADING === 'true') {
       // Simulate trade for paper trading
       const result = { orderID: 'paper-' + Date.now(), success: true };
-      executedTrades.push({ tokenId, side, amount, price, result, timestamp: Date.now() });
+      executedTrades.push({ tokenId, side, amount, price, result, timestamp: Date.now(), conditionId, outcome });
       console.log(`[PAPER TRADE] ${side} ${amount} @ ${price}`);
       return result;
     }
@@ -208,7 +218,7 @@ async function executeTrade(tokenId, amount, side, price, negRisk = false) {
       })
     });
     const result = await res.json();
-    executedTrades.push({ tokenId, side, amount, price, result, timestamp: Date.now() });
+    executedTrades.push({ tokenId, side, amount, price, result, timestamp: Date.now(), conditionId, outcome });
     return result;
   } catch (e) {
     return { error: e.message };
@@ -243,7 +253,7 @@ async function resolvePosition(conditionId, price) {
       if (currentValue > 0) {
         const pnl = currentValue - parseFloat(pos.initialValue || pos.initial_value || 0);
         sessionProfit += pnl;
-        
+
         memory.resolveBet(conditionId, price, price > 0.5 ? 'YES' : 'NO', pnl);
       }
     }
@@ -261,49 +271,56 @@ function shouldClosePosition(position, currentPrice) {
   const entryPrice = parseFloat(position.avgPrice || position.avg_price || 0);
   const size = parseFloat(position.size || 0);
   if (size <= 0) return false;
-  
+  if (entryPrice <= 0) return false; // can't compute PnL% without entry price
+
   const pnl = (currentPrice - entryPrice) * size;
   const pnlPercent = pnl / (entryPrice * size);
-  
+
   if (pnlPercent > 0.5) return true;
   if (pnlPercent < -0.3) return true;
   if (timeToEnd(position.endDate) < 3600000) return true;
-  
+
   return false;
 }
 
 async function managePositions(prices) {
   const positions = await getPositions();
   const orders = await getOrders();
-  
+
   const closeable = positions.filter(p => {
     const price = prices.get(p.asset);
     return price && shouldClosePosition(p, price);
   });
-  
+
   for (const pos of closeable) {
     const price = prices.get(pos.asset);
     console.log(`[MANAGE] Close ${pos.title} @ $${price} (pnl: ${((price - pos.avg_price) * pos.size).toFixed(2)})`);
-    
+
     await executeTrade(pos.asset, pos.size, 'SELL', price, !!pos.negativeRisk);
   }
-  
+
   const oldOrders = orders.filter(o => {
     const age = Date.now() - (parseFloat(o.created_at) * 1000);
     return age > 600000;
   });
-  
+
   for (const order of oldOrders) {
     await cancelOrder(order.id);
   }
 }
 
 async function runCycle() {
+  if (cycleRunning) {
+    console.log('[AGENT] Cycle already in progress, skipping');
+    return;
+  }
+  cycleRunning = true;
+  try {
   cycleCount++;
-  
+
   const balance = await getTradingBalance();
   const freeBalance = balance.usdc_bridged || balance.usdc || 0;
-  
+
   if (initialBankroll === 0) {
     initialBankroll = freeBalance;
     peakBankroll = freeBalance;
@@ -330,44 +347,49 @@ async function runCycle() {
     drawdownMode = 'reduce'; // Reduce bet sizes to 50%
     console.log(`[RISK] REDUCE: ${(drawdownFromPeak*100).toFixed(1)}% drawdown from peak, halving bet sizes`);
   }
-  
+
   await managePositions(lastPrices);
-  
+
   console.log(`\n[CYCLE ${cycleCount}] Balance: $${freeBalance.toFixed(2)} | Leverage: ${leverage}x | Target: $${TARGET_PROFIT.toLocaleString()}`);
   console.log(`[PROGRESS] $${freeBalance.toFixed(2)} / $${TARGET_PROFIT.toLocaleString()} (${((freeBalance/TARGET_PROFIT)*100).toFixed(6)}%)`);
 
   const opportunities = [];
+  const allMarkets = []; // collected for theta + arb scanning
 
   for (const query of SEARCH_QUERIES) {
     const markets = await searchMarkets(query);
-    
+
     for (const market of markets) {
+      allMarkets.push(market); // collect for theta/arb
+
       if (market.volume < 100) continue;
-      
+
       for (const token of market.tokens) {
         const price = token.price;
-        
+
         if (price < 0.05 || price > 0.95) continue;
-        
+
         const timeLeft = timeToEnd(market.endDate);
         if (timeLeft < 0) continue;
         if (timeLeft < 3600000 && price < 0.15) continue;
-        
+
         const news = await fetchMarketNews(market.conditionId, market.question);
         const sentiment = analyzeSentiment(news);
-        
+
         if (sentiment.sentiment === 'neutral') continue;
-        
+
         const patternCheck = checkPatterns(market.question, market.tokens);
         const confidence = Math.min(sentiment.confidence + patternCheck.bonus, 0.92);
-        
+
         if (confidence < CONFIDENCE_THRESHOLD) continue;
-        
+
         const side = sentiment.sentiment === 'positive' ? 'BUY' : 'SELL';
-        const size = calculateBetSize(confidence, price, freeBalance);
-        
+        let size = calculateBetSize(confidence, price, freeBalance);
+        // Apply drawdown reduction: halve bet sizes in reduce mode
+        if (drawdownMode === 'reduce') size = size * 0.5;
+
         if (size < MIN_PROFIT_TRADE) continue;
-        
+
         opportunities.push({
           market,
           token,
@@ -378,14 +400,145 @@ async function runCycle() {
           reason: `${sentiment.sentiment} from ${news.length} sources`,
           negRisk: market.negRisk
         });
-        
+
         lastPrices.set(token.tokenId, price);
       }
-      
+
       if (opportunities.length >= MAX_TRADES_PER_CYCLE * 2) break;
     }
-    
+
     if (opportunities.length >= MAX_TRADES_PER_CYCLE * 2) break;
+  }
+
+  // ── Theta scan: run on all discovered markets ──
+  // Convert processed markets back to format theta expects (outcomePrices as string)
+  const thetaMarkets = allMarkets.map(m => ({
+    ...m,
+    outcomePrices: m.tokens.map(t => t.price).join(','),
+    price: m.tokens[0]?.price || 0,
+    category: m.description || ''
+  }));
+
+  const thetaOpps = scanThetaOpportunities(thetaMarkets);
+
+  for (const theta of thetaOpps) {
+    let confidence;
+    switch (theta.type) {
+      case 'fade-overconfidence':
+        confidence = 0.70; // historically proven edge
+        break;
+      case 'theta-mispricing':
+        // Confidence proportional to edge size: 5% edge -> ~0.60, 15% edge -> ~0.80
+        confidence = Math.min(0.50 + parseFloat(theta.edge) * 0.02, 0.85);
+        break;
+      case 'near-expiry-no-farm':
+        confidence = 0.60;
+        break;
+      default:
+        confidence = 0.55;
+    }
+
+    // Derive side from theta direction
+    const side = theta.direction.includes('SELL') ? 'SELL' : 'BUY';
+    // Find matching token from collected markets
+    const matchedMarket = allMarkets.find(m => m.conditionId === theta.conditionId);
+    if (!matchedMarket || !matchedMarket.tokens || matchedMarket.tokens.length === 0) continue;
+    const token = matchedMarket.tokens[0];
+
+    const thetaPrice = parseFloat(theta.price) || token.price;
+    let size = calculateBetSize(confidence, thetaPrice, freeBalance);
+    if (drawdownMode === 'reduce') size = size * 0.5;
+    if (size < MIN_PROFIT_TRADE) continue;
+
+    opportunities.push({
+      market: matchedMarket,
+      token,
+      side,
+      confidence,
+      size,
+      sentiment: 'theta',
+      reason: `[THETA] ${theta.type}: ${theta.reasoning}`,
+      negRisk: matchedMarket.negRisk
+    });
+
+    lastPrices.set(token.tokenId, thetaPrice);
+  }
+
+  if (thetaOpps.length > 0) {
+    console.log(`[THETA] ${thetaOpps.length} theta opportunities found`);
+  }
+
+  // ── Arb scanner: run every 5th cycle (~75s) ──
+  if (cycleCount % 5 === 0) {
+    try {
+      console.log(`[ARB] Running arbitrage scan (cycle ${cycleCount})...`);
+
+      // Convert processed markets back to raw-ish format for arb scanner
+      const arbMarkets = allMarkets.map(m => ({
+        question: m.question,
+        conditionId: m.conditionId,
+        closed: m.closed,
+        outcomePrices: m.tokens.map(t => t.price).join(','),
+        price: m.tokens[0]?.price || 0,
+        volume: m.volume
+      }));
+
+      const crossArbs = await scanArbitrage(arbMarkets);
+      const sumToOneArbs = await scanSumToOneArb(arbMarkets);
+      const allArbs = [...crossArbs, ...sumToOneArbs];
+
+      const highConfidenceArbs = allArbs.filter(arb => {
+        const netSpreadPct = parseFloat(arb.netSpread);
+        return netSpreadPct >= 3; // >3% net spread threshold
+      });
+
+      for (const arb of highConfidenceArbs) {
+        console.log(`[ARB] PRIORITY: ${(arb.type || 'cross-platform')} arb - net spread ${arb.netSpread} on "${arb.polymarket?.title || arb.title}"`);
+
+        // Find matching market from collected data
+        const arbConditionId = arb.polymarket?.conditionId || arb.conditionId;
+        const arbMarket = allMarkets.find(m => m.conditionId === arbConditionId);
+
+        if (arbMarket && arbMarket.tokens && arbMarket.tokens.length > 0) {
+          // Execute arb with priority - buy both sides for sum-to-one, or the cheaper side for cross-platform
+          for (const token of arbMarket.tokens) {
+            const arbSize = Math.min(freeBalance * 0.05, 50); // conservative: 5% of balance, max $50
+            const result = await executeTrade(
+              token.tokenId,
+              arbSize,
+              'BUY',
+              token.price,
+              arbMarket.negRisk,
+              arbMarket.conditionId,
+              token.outcome
+            );
+
+            if (result.orderID || result.tx || result.success) {
+              recordBet({
+                conditionId: arbMarket.conditionId,
+                tokenId: token.tokenId,
+                title: arbMarket.question,
+                outcome: token.outcome,
+                side: 'BUY',
+                entryPrice: token.price,
+                size: arbSize,
+                newsSnippet: `[ARB] ${(arb.type || 'cross-platform')} net spread ${arb.netSpread}`,
+                decisionReason: `Arbitrage: ${(arb.type || 'cross-platform')} net spread ${arb.netSpread}`,
+                confidence: 0.95,
+                paperMode: process.env.PAPER_TRADING === 'true'
+              });
+              console.log(`[ARB] EXECUTED: BUY $${arbSize} ${token.outcome} @ $${token.price}`);
+            }
+          }
+        }
+      }
+
+      if (allArbs.length > 0) {
+        console.log(`[ARB] ${allArbs.length} arbs found, ${highConfidenceArbs.length} with >3% net spread`);
+      }
+    } catch (e) {
+      console.error(`[ARB] Scan error: ${e.message}`);
+    }
   }
 
   if (opportunities.length === 0) {
@@ -403,15 +556,17 @@ async function runCycle() {
 
   for (const opp of selected) {
     if (totalSize >= freeBalance * 0.8) break;
-    
+
     const result = await executeTrade(
       opp.token.tokenId,
       opp.size,
       opp.side,
       opp.token.price,
-      opp.negRisk
+      opp.negRisk,
+      opp.market.conditionId,
+      opp.token.outcome
     );
-    
+
     if (result.orderID || result.tx || result.success) {
       recordBet({
         conditionId: opp.market.conditionId,
@@ -440,8 +595,11 @@ async function runCycle() {
 
   console.log(`[CYCLE ${cycleCount}] Executed ${executed} trades, Total: $${totalSize.toFixed(2)}`);
   console.log(`[SESSION] Profit: $${sessionProfit.toFixed(2)} | Wagered: $${totalWagered.toFixed(2)}`);
-  
+
   lastUpdate = Date.now();
+  } finally {
+    cycleRunning = false;
+  }
 }
 
 function getAgentStatus() {
@@ -465,16 +623,24 @@ function getAgentStatus() {
 }
 
 let intervalId = null;
+let cycleRunning = false;
 
 async function startAgent() {
   if (isRunning) return;
   isRunning = true;
   console.log(`[AGENT] Starting autonomous agent... Target: $${TARGET_PROFIT.toLocaleString()}`);
-  
+
   await getTradingBalance();
   await runCycle();
-  
-  intervalId = setInterval(runCycle, CYCLE_MS);
+
+  intervalId = setInterval(async () => {
+    // Prevent overlapping cycles: if previous cycle is still running, skip this tick
+    if (cycleRunning) {
+      console.log('[AGENT] Previous cycle still running, skipping this tick');
+      return;
+    }
+    await runCycle();
+  }, CYCLE_MS);
 }
 
 function stopAgent() {
@@ -490,28 +656,28 @@ async function checkResolved() {
   try {
     const res = await fetch(`https://gamma-api.polymarket.com/markets?closed=true&limit=100`);
     const markets = await res.json();
-    
+
     for (const m of markets) {
       if (!m.resolved) continue;
-      
+
       const winner = m.winner || '';
       const volume = parseFloat(m.volume || 0);
-      
+
       try {
         recordMarketResolved(m.conditionId, m.question, winner, volume);
-        
-        const marketPositions = executedTrades.filter(t => 
+
+        const marketPositions = executedTrades.filter(t =>
           t.conditionId === m.conditionId
         );
-        
+
         for (const pos of marketPositions) {
           const resolvedPrice = winner === pos.outcome ? 1 : 0;
-          const pnl = pos.side === 'BUY' 
+          const pnl = pos.side === 'BUY'
             ? (resolvedPrice - pos.price) * pos.amount
             : (pos.price - resolvedPrice) * pos.amount;
-          
+
           resolveBet(m.conditionId, resolvedPrice, winner, pnl);
-          
+
           const pattern = m.question.split(' ').slice(0, 3).join(' ');
           if (pattern && pnl !== 0) {
             updatePattern(pattern, winner, pnl);
@@ -532,7 +698,7 @@ if (require.main === module) {
   (async () => {
     console.log('[AGENT] Starting $100M autonomous agent...');
     await startAgent();
-    
+
     process.on('SIGINT', () => {
       stopAgent();
       console.log(`\n[SESSION] Final Profit: $${sessionProfit.toFixed(2)}`);

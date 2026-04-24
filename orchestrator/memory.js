@@ -172,9 +172,9 @@ function getWinningPatterns() {
 
 function recordTraderPerformance(targetAddress, targetName, totalTrades, winRate, avgPnl, recentPnl) {
   db.prepare(`
-    INSERT OR REPLACE INTO trader_performance 
+    INSERT OR REPLACE INTO trader_performance
     (target_address, target_name, total_trades, win_rate, avg_pnl, recent_pnl, last_trade_ts)
-    VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))
+    VALUES (?, ?, ?, ?, ?, ?, datetime('now'))
   `).run(targetAddress, targetName, totalTrades, winRate, avgPnl, recentPnl);
 }
 

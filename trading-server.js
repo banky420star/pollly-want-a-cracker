@@ -578,8 +578,12 @@ app.get('/api/search', async (req, res) => {
 
 app.get('/api/price/:tokenId', async (req, res) => {
   try {
+    const tokenId = req.params.tokenId;
+    if (!tokenId || !/^0x[0-9a-f]+$/i.test(tokenId)) {
+      return res.status(400).json({ error: 'Invalid token ID format' });
+    }
     const tempClient = new ClobClient(HOST, CHAIN_ID);
-    const price = await tempClient.getPrice(req.params.tokenId, Side.BUY);
+    const price = await tempClient.getPrice(tokenId, Side.BUY);
     res.json(price);
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -674,9 +678,13 @@ app.post('/api/market-buy', async (req, res) => {
           console.log(`[SLIPPAGE] BUY rejected: bestAsk=${bestAsk} mid=${midpoint.toFixed(4)} slippage=${(slippage*100).toFixed(1)}%`);
           return res.status(400).json({ error: 'Slippage too high', bestAsk, midpoint, slippagePct: (slippage*100).toFixed(2) + '%' });
         }
+      } else if (bestAsk === 0) {
+        console.log(`[SLIPPAGE] BUY rejected: no asks in order book for token ${tokenId.slice(0,10)}...`);
+        return res.status(400).json({ error: 'No asks available in order book' });
       }
     } catch (e) {
-      console.log('[SLIPPAGE] Order book check failed, proceeding without slippage guard:', e.message);
+      console.error('[SLIPPAGE] Order book check failed, rejecting trade for safety:', e.message);
+      return res.status(503).json({ error: 'Order book unavailable, cannot verify slippage', detail: e.message });
     }
 
     console.log(`[TRADE] MARKET BUY $${amount} token=${tokenId.slice(0, 10)}...`);
@@ -716,9 +724,13 @@ app.post('/api/market-sell', async (req, res) => {
           console.log(`[SLIPPAGE] SELL rejected: bestBid=${bestBid} mid=${midpoint.toFixed(4)} slippage=${(slippage*100).toFixed(1)}%`);
           return res.status(400).json({ error: 'Slippage too high', bestBid, midpoint, slippagePct: (slippage*100).toFixed(2) + '%' });
         }
+      } else if (bestBid === 0) {
+        console.log(`[SLIPPAGE] SELL rejected: no bids in order book for token ${tokenId.slice(0,10)}...`);
+        return res.status(400).json({ error: 'No bids available in order book' });
       }
     } catch (e) {
-      console.log('[SLIPPAGE] Order book check failed, proceeding without slippage guard:', e.message);
+      console.error('[SLIPPAGE] Order book check failed, rejecting trade for safety:', e.message);
+      return res.status(503).json({ error: 'Order book unavailable, cannot verify slippage', detail: e.message });
     }
 
     console.log(`[TRADE] MARKET SELL ${amount} shares token=${tokenId.slice(0, 10)}...`);
