@@ -285,6 +285,32 @@ async function getMarketMeta(conditionId) {
   return { negRisk: false, tickSize: '0.01' };
 }
 
+// ── Market expiry cache (Gamma API returns endDate, CLOB API does not) ──
+const marketExpiryCache = {};
+const MARKET_EXPIRY_CACHE_MS = 10 * 60 * 1000;
+
+async function getMarketExpiry(conditionId) {
+  if (!conditionId) return null;
+  const cached = marketExpiryCache[conditionId];
+  if (cached && (Date.now() - cached._ts) < MARKET_EXPIRY_CACHE_MS) {
+    return cached.endDate;
+  }
+  try {
+    const res = await fetch(`https://gamma-api.polymarket.com/markets?conditionId=${conditionId}&limit=1`);
+    if (res.ok) {
+      const markets = await res.json();
+      if (markets && markets.length > 0 && markets[0].endDate) {
+        const endDate = markets[0].endDate;
+        marketExpiryCache[conditionId] = { endDate, _ts: Date.now() };
+        return endDate;
+      }
+    }
+  } catch (e) {
+    console.error('[EXPIRY] Error fetching market expiry:', e.message);
+  }
+  return null;
+}
+
 // ============================================================
 // LIVE TRADING ENGINE
 // ============================================================
@@ -1477,6 +1503,21 @@ async function processPaperTrade(strategy, target, trade, whaleBoost = 1.0) {
   if (txHash) {
     const dup = db.prepare('SELECT id FROM paper_trades WHERE target_tx = ? AND strategy_id = ?').get(txHash, strategy.id);
     if (dup) return;
+  }
+
+  // Skip BUY trades on markets resolving >30 days out (faster capital turnover)
+  if (side === 'BUY') {
+    const conditionId = trade.conditionId || trade.condition_id;
+    if (conditionId) {
+      const endDate = await getMarketExpiry(conditionId);
+      if (endDate) {
+        const daysToResolution = (new Date(endDate).getTime() - Date.now()) / (1000 * 60 * 60 * 24);
+        if (daysToResolution > 30) {
+          console.log(`[TURNOVER] Skip: "${trade.title || conditionId.slice(0,10)}" resolves in ${daysToResolution.toFixed(0)}d (>30d)`);
+          return;
+        }
+      }
+    }
   }
 
   const tradeTime = trade.timestamp

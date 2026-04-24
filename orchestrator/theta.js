@@ -53,7 +53,7 @@ function scanThetaOpportunities(markets) {
     if (!endDate) continue;
 
     const daysToExpiry = (endDate - Date.now()) / (1000 * 60 * 60 * 24);
-    if (daysToExpiry <= 0 || daysToExpiry > 90) continue;
+    if (daysToExpiry <= 0 || daysToExpiry > 14) continue;
 
     // Determine sigma based on category
     const category = (m.category || m.groupItemTitle || '').toLowerCase();

@@ -66,7 +66,7 @@ let lastPrices = new Map();
 
 async function searchMarkets(query) {
   try {
-    const res = await fetch(`https://gamma-api.polymarket.com/markets?closed=false&limit=20&title_contains=${encodeURIComponent(query)}`);
+    const res = await fetch(`https://gamma-api.polymarket.com/markets?active=true&closed=false&limit=20&order=volume24hr&ascending=false&title_contains=${encodeURIComponent(query)}`);
     const markets = await res.json();
 
     return markets.map(m => {
@@ -93,6 +93,54 @@ async function searchMarkets(query) {
     }).filter(m => m.tokens.length > 0 && !m.closed);
   } catch (e) {
     console.error('[SEARCH] Error:', e.message);
+    return [];
+  }
+}
+
+async function fetchLiveMarkets(limit = 50) {
+  try {
+    const res = await fetch(`https://gamma-api.polymarket.com/events?active=true&closed=false&order=volume24hr&ascending=false&limit=${limit}`);
+    const events = await res.json();
+    const markets = [];
+
+    for (const event of events) {
+      if (!event.markets || !Array.isArray(event.markets)) continue;
+
+      for (const m of event.markets) {
+        const tokenIds = JSON.parse(m.clobTokenIds || '[]');
+        const outcomes = JSON.parse(m.outcomes || '[]');
+        const prices = JSON.parse(m.outcomePrices || '[]');
+
+        if (tokenIds.length === 0 || m.closed) continue;
+
+        const tokens = tokenIds.map((id, i) => ({
+          tokenId: id,
+          outcome: outcomes[i],
+          price: parseFloat(prices[i] || 0)
+        })).filter(t => t.price > 0);
+
+        if (tokens.length === 0) continue;
+
+        markets.push({
+          conditionId: m.conditionId,
+          question: m.question,
+          slug: m.slug,
+          tokens,
+          active: m.active,
+          closed: m.closed,
+          volume: parseFloat(m.volume || 0),
+          negRisk: m.negRisk || false,
+          endDate: m.endDate || null,
+          description: m.description || '',
+          volume24hr: parseFloat(m.volume24hr || 0)
+        });
+      }
+    }
+
+    console.log(`[LIVE-MARKETS] Fetched ${markets.length} live markets from ${events.length} events`);
+    return markets;
+  } catch (e) {
+    console.error('[LIVE-MARKETS] Error:', e.message);
     return [];
   }
 }
@@ -355,12 +403,28 @@ async function runCycle() {
 
   const opportunities = [];
   const allMarkets = []; // collected for theta + arb scanning
+  const seenConditionIds = new Set();
 
+  // Primary: fetch high-volume live markets by event (fast, deduplicated)
+  const liveMarkets = await fetchLiveMarkets(50);
+  for (const market of liveMarkets) {
+    allMarkets.push(market);
+    seenConditionIds.add(market.conditionId);
+  }
+
+  // Supplemental: keyword search for niche topics not in top-50 events
   for (const query of SEARCH_QUERIES) {
     const markets = await searchMarkets(query);
 
     for (const market of markets) {
-      allMarkets.push(market); // collect for theta/arb
+      if (seenConditionIds.has(market.conditionId)) continue;
+      allMarkets.push(market);
+      seenConditionIds.add(market.conditionId);
+    }
+  }
+
+  // Process all collected markets
+  for (const market of allMarkets) {
 
       if (market.volume < 100) continue;
 
@@ -379,7 +443,16 @@ async function runCycle() {
         if (sentiment.sentiment === 'neutral') continue;
 
         const patternCheck = checkPatterns(market.question, market.tokens);
-        const confidence = Math.min(sentiment.confidence + patternCheck.bonus, 0.92);
+
+        // Turnover boost: prefer markets resolving sooner for faster capital recycling
+        const daysToExpiry = market.endDate ? (new Date(market.endDate).getTime() - Date.now()) / (1000 * 60 * 60 * 24) : Infinity;
+        let turnoverBoost = 0;
+        if (daysToExpiry <= 3)       turnoverBoost = 0.08;
+        else if (daysToExpiry <= 7)  turnoverBoost = 0.05;
+        else if (daysToExpiry <= 14) turnoverBoost = 0.02;
+        else if (daysToExpiry > 30)  turnoverBoost = -0.03;
+
+        const confidence = Math.min(sentiment.confidence + patternCheck.bonus + turnoverBoost, 0.92);
 
         if (confidence < CONFIDENCE_THRESHOLD) continue;
 
@@ -405,7 +478,6 @@ async function runCycle() {
       }
 
       if (opportunities.length >= MAX_TRADES_PER_CYCLE * 2) break;
-    }
 
     if (opportunities.length >= MAX_TRADES_PER_CYCLE * 2) break;
   }
@@ -692,7 +764,7 @@ async function checkResolved() {
 
 setInterval(checkResolved, 120000);
 
-module.exports = { startAgent, stopAgent, getAgentStatus, searchMarkets };
+module.exports = { startAgent, stopAgent, getAgentStatus, searchMarkets, fetchLiveMarkets };
 
 if (require.main === module) {
   (async () => {

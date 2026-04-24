@@ -16,7 +16,7 @@ let marketMaker = null;
 let mmActiveMarkets = new Set(); // track which markets MM is quoting
 
 async function searchMarkets(query) {
-  const res = await fetch(`https://gamma-api.polymarket.com/markets?closed=false&limit=10&title_contains=${encodeURIComponent(query)}`);
+  const res = await fetch(`https://gamma-api.polymarket.com/markets?active=true&closed=false&limit=10&order=volume24hr&ascending=false&title_contains=${encodeURIComponent(query)}`);
   const markets = await res.json();
   
   return markets.map(m => {
@@ -35,7 +35,8 @@ async function searchMarkets(query) {
       })),
       active: m.active,
       closed: m.closed,
-      volume: parseFloat(m.volume || 0)
+      volume: parseFloat(m.volume || 0),
+      endDate: m.endDate || null
     };
   }).filter(m => m.tokens.length > 0 && !m.closed);
 }
@@ -334,7 +335,7 @@ async function fetchTopMarketsByVolume(count) {
   const allMarkets = [];
   for (const query of MM_SEARCH_QUERIES) {
     try {
-      const res = await fetch(`https://gamma-api.polymarket.com/markets?closed=false&limit=20&title_contains=${encodeURIComponent(query)}`);
+      const res = await fetch(`https://gamma-api.polymarket.com/markets?active=true&closed=false&limit=20&order=volume24hr&ascending=false&title_contains=${encodeURIComponent(query)}`);
       const markets = await res.json();
       for (const m of markets) {
         const tokenIds = JSON.parse(m.clobTokenIds || '[]');
@@ -353,7 +354,8 @@ async function fetchTopMarketsByVolume(count) {
           question: m.question,
           tokens,
           volume: parseFloat(m.volume || 0),
-          negRisk: m.negRisk || false
+          negRisk: m.negRisk || false,
+          endDate: m.endDate || null
         });
       }
     } catch (e) {

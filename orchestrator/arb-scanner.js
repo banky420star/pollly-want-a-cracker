@@ -42,7 +42,7 @@ async function fetchKalshiMarkets(category) {
 
 async function fetchPolymarketMarkets(query) {
   try {
-    const url = `https://gamma-api.polymarket.com/markets?closed=false&limit=20&title_contains=${encodeURIComponent(query)}`;
+    const url = `https://gamma-api.polymarket.com/markets?active=true&closed=false&limit=20&order=volume24hr&ascending=false&title_contains=${encodeURIComponent(query)}`;
     const data = await fetchJSON(url);
     return data || [];
   } catch (e) {

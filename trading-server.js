@@ -143,7 +143,7 @@ async function loadOrDerive() {
 
 // ── GAMMA API for market search ──
 async function searchMarkets(query) {
-  const res = await fetch(`https://gamma-api.polymarket.com/markets?closed=false&limit=10&title_contains=${encodeURIComponent(query)}`);
+  const res = await fetch(`https://gamma-api.polymarket.com/markets?active=true&closed=false&limit=10&order=volume24hr&ascending=false&title_contains=${encodeURIComponent(query)}`);
   return res.json();
 }
 
